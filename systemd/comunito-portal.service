@@ -1,0 +1,14 @@
+[Unit]
+Description=Comunito Portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/comunito_portal
+ExecStart=/home/pi/comunito_portal/comunito-venv/bin/python portal_alpr_full.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

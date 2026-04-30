@@ -1,0 +1,7 @@
+comunito-venv/
+__pycache__/
+*.pyc
+*.log
+config_full.json
+*.bak*
+.DS_Store
