@@ -173,7 +173,7 @@ CAM_DEF = {
     "stable_hits_required": 2,
     "notfound_stable_hits_required": 4,
     "suppress_notfound_after_auth_sec": 8,
-    "latch_hold_sec": 30.0,
+    "latch_hold_sec": 1.0,
 
     # Pre-procesado (solo ALPR, NO afecta snapshot/stream)
     "pp_enabled": False,
@@ -253,7 +253,7 @@ def load_cfg():
         c["stable_hits_required"] = _clampi(c.get("stable_hits_required",2),1,5,2)
         c["notfound_stable_hits_required"] = _clampi(c.get("notfound_stable_hits_required",4),1,10,4)
         c["suppress_notfound_after_auth_sec"] = _clampi(c.get("suppress_notfound_after_auth_sec",8),0,60,8)
-        c["latch_hold_sec"] = max(1.0, float(c.get("latch_hold_sec",30.0)))
+        c["latch_hold_sec"] = max(1.0, float(c.get("latch_hold_sec",1.0)))
 
         for sect in ("owners","visitors"):
             w = c.get(sect,{}) or {}
@@ -744,6 +744,23 @@ def _preprocess_for_alpr(cam:int, frame_bgr):
         h, w = frame_bgr.shape[:2]
         if h < 20 or w < 20:
             return frame_bgr
+
+        if prof == "darkfighter":
+            try:
+                g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                g = frame_bgr
+            try:
+                g = cv2.bilateralFilter(g, 9, 75, 75)
+                table = np.array([((i / 255.0) ** (1.0/0.8)) * 255 for i in np.arange(0, 256)]).astype("uint8")
+                g = cv2.LUT(g, table)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+                g = clahe.apply(g)
+                blur = cv2.GaussianBlur(g, (0,0), 2.0)
+                g = cv2.addWeighted(g, 1.5, blur, -0.5, 0)
+                return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                pass
 
         if prof == "bw_hicontrast_sharp":
             clip = _clampf(c.get("pp_clahe_clip", 2.0), 1.0, 4.0, 2.0)
@@ -1586,6 +1603,8 @@ def _alpr_loop(cam:int):
                 _stable_state[cam-1]["hits"] = 1
 
             needed = int(cdict.get("stable_hits_required",2))
+            if conf >= 0.93 and det_conf >= 0.85: needed = 1
+
             if _stable_state[cam-1]["hits"] < needed:
                 time.sleep(0.01)
                 continue
@@ -1595,9 +1614,9 @@ def _alpr_loop(cam:int):
             titles=["Folio","Nombre","Telefono"]
             auth=False
 
-            needed = int(cdict.get("stable_hits_required",2))
             if user_type == "NONE":
                 needed = int(cdict.get("notfound_stable_hits_required",4))
+                if conf >= 0.93 and det_conf >= 0.85: needed = 1
 
             if _stable_state[cam-1]["hits"] < needed:
                 time.sleep(0.01)
@@ -1814,7 +1833,7 @@ async function openGate(cam){
   }catch(e){m.textContent='Error: '+e;} finally{setTimeout(()=>m.textContent='',1500);}
 }
 
-setInterval(poll,2500);
+setInterval(poll,500);
 poll();
 </script>
 """
@@ -2147,6 +2166,7 @@ SETTINGS_CAM = """
       <select name="pp_profile">
         <option value="none" {{'selected' if c.pp_profile=='none' else ''}}>none (sin cambios)</option>
         <option value="bw_hicontrast_sharp" {{'selected' if c.pp_profile=='bw_hicontrast_sharp' else ''}}>B/N alto contraste + nitidez</option>
+        <option value="darkfighter" {{'selected' if c.pp_profile=='darkfighter' else ''}}>Darkfighter (Bilateral+CLAHE+Gamma)</option>
       </select>
     </label>
     <label>CLAHE clipLimit (1.0-4.0)<br>
@@ -2474,7 +2494,7 @@ def settings_cam(cam:int):
         # Pre-procesado (solo ALPR)
         c["pp_enabled"]=bool(request.form.get("pp_enabled"))
         c["pp_profile"]=(request.form.get("pp_profile", c.get("pp_profile","none")) or "none").strip().lower()
-        if c["pp_profile"] not in ("none","bw_hicontrast_sharp"):
+        if c["pp_profile"] not in ("none","bw_hicontrast_sharp","darkfighter"):
             c["pp_profile"]="none"
         c["pp_clahe_clip"]=_clampf(request.form.get("pp_clahe_clip", c.get("pp_clahe_clip",2.0)), 1.0, 4.0, c.get("pp_clahe_clip",2.0))
         c["pp_sharp_strength"]=_clampf(request.form.get("pp_sharp_strength", c.get("pp_sharp_strength",0.55)), 0.0, 1.2, c.get("pp_sharp_strength",0.55))
