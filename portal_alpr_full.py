@@ -1948,24 +1948,32 @@ ROI_HTML = """<!doctype html><meta charset="utf-8"><title>ROI Cam {{cam}}</title
 
 <script>
 const cam={{cam}};
-const img=document.getElementById('raw');
+const imgEl=document.getElementById('raw');
 const cnv=document.getElementById('cnv');
 const ctx=cnv.getContext('2d');
 const proc=document.getElementById('proc');
+
+// Dimensiones FIJAS del canvas (se establecen al cargar la primera imagen y NO cambian).
+// Esto evita que el ROI "se mueva" cuando refrescamos el snapshot.
+let canvasW=0, canvasH=0;
 
 let roi={x:0,y:0,w:1,h:1,enabled:false};
 let dragging=false, sx=0, sy=0, ex=0, ey=0;
 
 function draw(){
-  if(!img.naturalWidth){return;}
-  cnv.width = img.naturalWidth; cnv.height = img.naturalHeight;
-  ctx.drawImage(img,0,0);
-  if(roi.w>0 && roi.h>0){
+  if(!canvasW || !canvasH) return;
+  ctx.clearRect(0,0,canvasW,canvasH);
+  if(imgEl.complete && imgEl.naturalWidth>0){
+    ctx.drawImage(imgEl, 0, 0, canvasW, canvasH);
+  }
+  // ROI guardado (verde)
+  if(roi.w>0.01 && roi.h>0.01){
     ctx.lineWidth=2; ctx.strokeStyle='rgba(0,200,0,0.9)';
     ctx.setLineDash([6,4]);
-    ctx.strokeRect(roi.x*cnv.width, roi.y*cnv.height, roi.w*cnv.width, roi.h*cnv.height);
+    ctx.strokeRect(roi.x*canvasW, roi.y*canvasH, roi.w*canvasW, roi.h*canvasH);
     ctx.setLineDash([]);
   }
+  // Rectángulo arrastrando (naranja)
   if(dragging){
     const x=Math.min(sx,ex), y=Math.min(sy,ey);
     const w=Math.abs(ex-sx), h=Math.abs(ey-sy);
@@ -1974,15 +1982,16 @@ function draw(){
   }
 }
 
+// Convierte coordenadas CSS (del evento mouse/touch) a coordenadas internas del canvas.
+// Usa las dimensiones CSS actuales del canvas (que cambian con el viewport) y las
+// escala a las dimensiones internas fijas (canvasW x canvasH).
 function _toCanvasXY(e){
   const r = cnv.getBoundingClientRect();
-  // Coordenadas en CSS pixels
   const cx = (e.clientX - r.left);
   const cy = (e.clientY - r.top);
-  // Escala CSS->canvas real
-  const sx = (cnv.width  / Math.max(1, r.width));
-  const sy = (cnv.height / Math.max(1, r.height));
-  return {x: cx*sx, y: cy*sy};
+  const scaleX = canvasW / Math.max(1, r.width);
+  const scaleY = canvasH / Math.max(1, r.height);
+  return {x: cx*scaleX, y: cy*scaleY};
 }
 
 function _startDrag(e){
@@ -2000,10 +2009,10 @@ function _endDrag(e){
   if(!dragging) return;
   e.preventDefault();
   dragging=false;
-  const x=Math.max(0,Math.min(sx,ex))/cnv.width;
-  const y=Math.max(0,Math.min(sy,ey))/cnv.height;
-  const w=Math.abs(ex-sx)/cnv.width;
-  const h=Math.abs(ey-sy)/cnv.height;
+  const x=Math.max(0, Math.min(sx,ex)) / canvasW;
+  const y=Math.max(0, Math.min(sy,ey)) / canvasH;
+  const w=Math.abs(ex-sx) / canvasW;
+  const h=Math.abs(ey-sy) / canvasH;
   if(w>0.01 && h>0.01){ roi.x=x; roi.y=y; roi.w=w; roi.h=h; }
   draw();
 }
@@ -2013,7 +2022,7 @@ cnv.addEventListener('mousedown', _startDrag);
 cnv.addEventListener('mousemove', _moveDrag);
 window.addEventListener('mouseup', _endDrag);
 
-// Touch (por si usas tablet)
+// Touch
 cnv.addEventListener('touchstart', (ev)=>{ if(ev.touches && ev.touches[0]) _startDrag(ev.touches[0]); }, {passive:false});
 cnv.addEventListener('touchmove',  (ev)=>{ if(ev.touches && ev.touches[0]) _moveDrag(ev.touches[0]);  }, {passive:false});
 window.addEventListener('touchend', (ev)=>{ _endDrag(ev.changedTouches && ev.changedTouches[0] ? ev.changedTouches[0] : ev); }, {passive:false});
@@ -2045,15 +2054,32 @@ document.getElementById('clearBtn').onclick=async ()=>{
   refreshProcessed();
 };
 
-async function refreshSnapshot(){ img.src='/snapshot.jpg?cam='+cam+'&w=960&ts='+(Date.now()); }
-async function refreshProcessed(){ proc.src='/snapshot_alpr.jpg?cam='+cam+'&w=960&ts='+(Date.now()); }
+async function refreshSnapshot(){
+  const tmp = new Image();
+  tmp.crossOrigin='anonymous';
+  tmp.onload = ()=>{
+    // Primera vez: fijar dimensiones del canvas a las de la imagen real
+    if(!canvasW || !canvasH){
+      canvasW = tmp.naturalWidth;
+      canvasH = tmp.naturalHeight;
+      cnv.width  = canvasW;
+      cnv.height = canvasH;
+    }
+    // Actualizar el src del img original para que draw() lo use
+    imgEl.src = tmp.src;
+    draw();
+  };
+  tmp.onerror = ()=>{ setTimeout(refreshSnapshot, 800); };
+  tmp.src = '/snapshot.jpg?cam='+cam+'&w=1280&q=90&ts='+(Date.now());
+}
 
-img.onload=()=>{ draw(); };
-img.onerror=()=>{ setTimeout(refreshSnapshot, 800); };
+async function refreshProcessed(){
+  proc.src='/snapshot_alpr.jpg?cam='+cam+'&w=1280&q=90&ts='+(Date.now());
+}
 
 window.onload=async ()=>{
   await loadCur();
-  refreshSnapshot();
+  await refreshSnapshot();
   refreshProcessed();
   setInterval(refreshSnapshot, 4000);
   setInterval(refreshProcessed, 1200);
@@ -2798,7 +2824,7 @@ def snapshot():
     if w>32:
         h,wi=fr2.shape[:2]; tw=min(w,wi); th=int(h*(tw/float(wi)))
         fr2=cv2.resize(fr2,(tw,th),interpolation=cv2.INTER_AREA)
-    ok,buf=cv2.imencode(".jpg", fr2, [cv2.IMWRITE_JPEG_QUALITY,75])
+    ok,buf=cv2.imencode(".jpg", fr2, [cv2.IMWRITE_JPEG_QUALITY,92])
     if not ok: return ("Encode error",500,{"Content-Type":"text/plain"})
     r=Response(buf.tobytes(), mimetype="image/jpeg")
     r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0, no-transform"
