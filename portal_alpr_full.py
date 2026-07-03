@@ -1,8 +1,9 @@
 from __future__ import annotations
 from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for, send_file
-import cv2, threading, time, os, json, csv, requests, subprocess, re, datetime, base64, queue, glob
-# Forzar a OpenCV FFmpeg a usar transporte TCP y limitar la latencia sin descartar paquetes predictivos
+import os
+# Configurar opciones de OpenCV FFmpeg ANTES de importar cv2 para forzar el uso de TCP y evitar pérdida de frames predictivos (pantallas grises)
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|max_delay;500000|analyzeduration;500000|probesize;500000"
+import cv2, threading, time, json, csv, requests, subprocess, re, datetime, base64, queue, glob
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
