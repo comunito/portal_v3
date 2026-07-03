@@ -573,7 +573,9 @@ def _ping(ip:str, timeout=1)->bool:
         return False
 
 # ========== RTSP LOW-LATENCY ==========
-# (Las opciones de FFmpeg ya se configuraron al inicio del script, antes de importar cv2)
+# Estrategia: usar ffmpeg como subproceso directo para decodificar H.264/H.265
+# con flags de descarte de frames corruptos. Esto elimina las pantallas grises
+# que produce el decodificador integrado de OpenCV con streams HEVC por WiFi.
 
 class VideoSource:
     def __init__(self, cidx:int):
@@ -587,54 +589,78 @@ class VideoSource:
 
     def get(self):
         with self.lock:
-            return self.frame
+            if self.frame is not None:
+                return self.frame.copy()
+            return None
 
     def get_with_ts(self):
         with self.lock:
-            return self.frame, self.ts
+            if self.frame is not None:
+                return self.frame.copy(), self.ts
+            return None, self.ts
 
-    def _open_cv(self, url): return cv2.VideoCapture(url)
+    def _probe_resolution(self, url):
+        """Sondear resolución del flujo RTSP con ffprobe."""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=width,height',
+                 '-of', 'csv=p=0:s=x',
+                 '-rtsp_transport', 'tcp', url],
+                capture_output=True, text=True, timeout=10
+            )
+            parts = result.stdout.strip().split('x')
+            if len(parts) == 2:
+                w, h = int(parts[0]), int(parts[1])
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception as e:
+            print(f"[CAM{self.cidx+1}] ffprobe error: {e}")
+        return None, None
 
-    def _open_gst(self, url):
-        """Abrir flujo RTSP con GStreamer usando decodebin (soporta H.264 Y H.265 automáticamente)."""
-        if not url.lower().startswith("rtsp://"): return None
+    def _open_ffmpeg_pipe(self, url):
+        """Abrir flujo RTSP con ffmpeg subprocess.
+        Soporta H.264 Y H.265 nativamente con recuperación de errores."""
+        orig_w, orig_h = self._probe_resolution(url)
+        if not orig_w:
+            print(f"[CAM{self.cidx+1}] ffprobe no pudo detectar resolución")
+            return None, 0, 0
 
-        # Pipeline universal con decodebin: autodetecta codec (H.264, H.265, MJPEG, etc.)
-        pipeline_universal = (
-            f'rtspsrc location="{url}" protocols=tcp latency=200 '
-            'drop-on-latency=true do-retransmission=false ! '
-            'decodebin ! videoconvert ! video/x-raw,format=BGR ! '
-            'appsink sync=false max-buffers=2 drop=true'
-        )
-        cap = cv2.VideoCapture(pipeline_universal, cv2.CAP_GSTREAMER)
-        if cap is not None and cap.isOpened():
-            return cap
+        mx = int(cfg["cameras"][self.cidx].get("resize_max_w", 800))
+        out_w = min(mx, orig_w)
+        out_h = int(orig_h * out_w / orig_w)
+        # Asegurar dimensiones pares para ffmpeg
+        out_w -= out_w % 2
+        out_h -= out_h % 2
 
-        # Fallback: pipeline explícito para H.265/HEVC
-        pipeline_h265 = (
-            f'rtspsrc location="{url}" protocols=tcp latency=200 '
-            'drop-on-latency=true do-retransmission=false ! '
-            'rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! '
-            'video/x-raw,format=BGR ! '
-            'appsink sync=false max-buffers=2 drop=true'
-        )
-        cap = cv2.VideoCapture(pipeline_h265, cv2.CAP_GSTREAMER)
-        if cap is not None and cap.isOpened():
-            return cap
+        cmd = [
+            'ffmpeg',
+            '-rtsp_transport', 'tcp',
+            '-fflags', '+discardcorrupt+nobuffer',
+            '-flags', 'low_delay',
+            '-err_detect', 'ignore_err',
+            '-i', url,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-vf', f'scale={out_w}:{out_h}',
+            '-an', '-sn',
+            '-loglevel', 'error',
+            'pipe:1'
+        ]
 
-        # Fallback: pipeline explícito para H.264
-        pipeline_h264 = (
-            f'rtspsrc location="{url}" protocols=tcp latency=200 '
-            'drop-on-latency=true do-retransmission=false ! '
-            'rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! '
-            'video/x-raw,format=BGR ! '
-            'appsink sync=false max-buffers=2 drop=true'
-        )
-        cap = cv2.VideoCapture(pipeline_h264, cv2.CAP_GSTREAMER)
-        if cap is not None and cap.isOpened():
-            return cap
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=out_w * out_h * 3 * 3
+            )
+            return proc, out_w, out_h
+        except Exception as e:
+            print(f"[CAM{self.cidx+1}] Error al iniciar ffmpeg: {e}")
+            return None, 0, 0
 
-        return None
+    def _open_cv(self, url):
+        """Fallback: abrir con OpenCV VideoCapture."""
+        return cv2.VideoCapture(url)
 
     def start(self):
         if self.running: return
@@ -657,66 +683,92 @@ class VideoSource:
             if ip: self.last_ip=ip
             if self.last_ip and not _ping(self.last_ip,1):
                 time.sleep(0.5); continue
-            cap=None
-            using_gst = False
-            try:
-                cap = self._open_gst(url)
-                if cap is not None and cap.isOpened():
-                    print(f"[CAM{self.cidx+1}] ✅ Abierta con GStreamer (H.264/H.265 auto, latencia baja)")
-                    using_gst = True
-                else:
-                    print(f"[CAM{self.cidx+1}] ⚠️ GStreamer no disponible. Usando OpenCV FFmpeg (TCP)...")
-                    cap = self._open_cv(url)
-                if not cap or not cap.isOpened():
-                    time.sleep(0.6); continue
 
-                # ── Zero-Latency Buffer (solo aplica a FFmpeg backend) ──
-                if not using_gst:
+            proc = None
+            cap = None
+            try:
+                # ── Método principal: ffmpeg subprocess (H.264 + H.265 nativo) ──
+                proc, fw, fh = self._open_ffmpeg_pipe(url)
+                if proc and fw > 0 and fh > 0:
+                    print(f"[CAM{self.cidx+1}] ✅ Abierta con ffmpeg pipe ({fw}x{fh}, H.264/H.265 auto)")
+                    frame_size = fw * fh * 3
+                    last = time.time()
+                    while self.running:
+                        raw = proc.stdout.read(frame_size)
+                        thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
+                        if len(raw) != frame_size:
+                            print(f"[CAM{self.cidx+1}] Flujo ffmpeg interrumpido, reconectando...")
+                            break
+
+                        fr = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3)).copy()
+
+                        with self.lock:
+                            self.frame = fr
+                            self.ts = time.time()
+
+                        if (time.time() - last) > 2.0:
+                            last = time.time()
+                            url2, ip2, _ = materialize_url(c)
+                            if ip2 and self.last_ip and ip2 != self.last_ip:
+                                break
+                        time.sleep(0.001)
+                else:
+                    # ── Fallback: OpenCV VideoCapture ──
+                    print(f"[CAM{self.cidx+1}] ⚠️ ffmpeg pipe no disponible. Usando OpenCV FFmpeg (TCP)...")
+                    cap = self._open_cv(url)
+                    if not cap or not cap.isOpened():
+                        time.sleep(0.6); continue
+
                     try:
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     except Exception:
                         pass
 
-                consecutive_errors = 0
-                last = time.time()
-                while self.running:
-                    ok, fr = cap.read()
-                    thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
-                    if not ok or fr is None:
-                        consecutive_errors += 1
-                        if consecutive_errors > 30:
-                            print(f"[CAM{self.cidx+1}] Demasiados errores de lectura, reconectando...")
-                            break
-                        time.sleep(0.01)
-                        continue
                     consecutive_errors = 0
+                    last = time.time()
+                    while self.running:
+                        ok, fr = cap.read()
+                        thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
+                        if not ok or fr is None:
+                            consecutive_errors += 1
+                            if consecutive_errors > 30:
+                                print(f"[CAM{self.cidx+1}] Demasiados errores, reconectando...")
+                                break
+                            time.sleep(0.01)
+                            continue
+                        consecutive_errors = 0
 
-                    try:
-                        mx=int(cfg["cameras"][self.cidx].get("resize_max_w",1280))
-                        if mx and fr.shape[1] > mx:
-                            h,w = fr.shape[:2]
-                            tw=mx
-                            th=int(max(36, h*(tw/float(w))))
-                            fr=cv2.resize(fr, (tw,th), interpolation=cv2.INTER_AREA)
-                    except:
-                        pass
+                        try:
+                            mx=int(cfg["cameras"][self.cidx].get("resize_max_w",800))
+                            if mx and fr.shape[1] > mx:
+                                h,w = fr.shape[:2]
+                                tw=mx
+                                th=int(max(36, h*(tw/float(w))))
+                                fr=cv2.resize(fr, (tw,th), interpolation=cv2.INTER_AREA)
+                        except:
+                            pass
 
-                    with self.lock:
-                        self.frame=fr
-                        self.ts=time.time()
+                        with self.lock:
+                            self.frame=fr
+                            self.ts=time.time()
 
-                    if (time.time()-last)>2.0:
-                        last=time.time()
-                        url2, ip2, _ = materialize_url(c)
-                        if ip2 and self.last_ip and ip2!=self.last_ip:
-                            break
-                    time.sleep(0.001)
-            except Exception:
-                pass
+                        if (time.time()-last)>2.0:
+                            last=time.time()
+                            url2, ip2, _ = materialize_url(c)
+                            if ip2 and self.last_ip and ip2!=self.last_ip:
+                                break
+                        time.sleep(0.001)
+            except Exception as e:
+                print(f"[CAM{self.cidx+1}] Error en captura: {e}")
             finally:
-                try:
-                    if cap: cap.release()
-                except: pass
+                if proc:
+                    try: proc.kill()
+                    except: pass
+                    try: proc.stdout.close()
+                    except: pass
+                if cap:
+                    try: cap.release()
+                    except: pass
             time.sleep(0.3)
 
 grab=[VideoSource(0), VideoSource(1)]
