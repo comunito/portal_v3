@@ -1,8 +1,8 @@
 from __future__ import annotations
 from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for, send_file
 import cv2, threading, time, os, json, csv, requests, subprocess, re, datetime, base64, queue, glob
-# Forzar a OpenCV FFmpeg a usar transporte TCP, deshabilitar buffers y minimizar la latencia de inicio
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|max_delay;100000|analyzeduration;100000|probesize;100000|fflags;nobuffer|flags;low_delay"
+# Forzar a OpenCV FFmpeg a usar transporte TCP y limitar la latencia sin descartar paquetes predictivos
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|max_delay;500000|analyzeduration;500000|probesize;500000"
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
@@ -644,10 +644,7 @@ class VideoSource:
                 except Exception:
                     pass
 
-                frame_skip = 3
                 while self.running:
-                    for _ in range(frame_skip - 1):
-                        cap.grab()
                     ok, fr = cap.read()
                     thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
                     if not ok or fr is None: break
