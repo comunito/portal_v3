@@ -1,6 +1,8 @@
 from __future__ import annotations
 from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for, send_file
 import cv2, threading, time, os, json, csv, requests, subprocess, re, datetime, base64, queue, glob
+# Forzar a OpenCV FFmpeg a usar transporte TCP, deshabilitar buffers y minimizar la latencia de inicio
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|max_delay;100000|analyzeduration;100000|probesize;100000|fflags;nobuffer|flags;low_delay"
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
@@ -627,8 +629,12 @@ class VideoSource:
                 time.sleep(0.5); continue
             cap=None
             try:
-                print(f"[CAM{self.cidx+1}] opening via OpenCV/FFmpeg only")
-                cap=self._open_cv(url)
+                cap = self._open_gst(url)
+                if cap is not None and cap.isOpened():
+                    print(f"[CAM{self.cidx+1}] Abierta con GStreamer (latencia 0)")
+                else:
+                    print(f"[CAM{self.cidx+1}] GStreamer no disponible. Usando OpenCV FFmpeg con fflags=nobuffer...")
+                    cap = self._open_cv(url)
                 if not cap or not cap.isOpened():
                     time.sleep(0.6); continue
 
@@ -1735,30 +1741,34 @@ def _alpr_loop(cam:int):
     while True:
         thread_heartbeats[f"alpr_cam{cam}"] = time.time()
         try:
-            fr, ts = grab[cam-1].get_with_ts()
-            if fr is None or ts == last_frame_ts:
-                time.sleep(0.02)
-                continue
-            last_frame_ts = ts
-
             cdict=cfg["cameras"][cam-1]
             mot=motion[cam-1]
 
-            if cdict["motion"].get("enabled",True) and not mot.active:
-                time.sleep(0.20)
+            # 1. Verificar si hay movimiento antes de hacer cualquier cosa (evitamos consumir CPU)
+            if cdict["motion"].get("enabled", True) and not mot.active:
+                time.sleep(0.15)
                 if mot.trigger.is_set():
                     mot.trigger.clear()
                 else:
                     continue
 
+            # 2. Control de salteo de frames
+            # Si se acaba de activar el movimiento, procesamos el primer frame de inmediato (k=0)
             if mot.trigger.is_set():
                 mot.trigger.clear()
-                k=0
+                k = 0
+            else:
+                k = (k + 1) % cdict["process_every_n"]
+                if k != 0:
+                    time.sleep(0.01)
+                    continue
 
-            k=(k+1)%cdict["process_every_n"]
-            if k!=0:
+            # 3. Obtener el frame más RECIENTE posible justo antes de la inferencia IA
+            fr, ts = grab[cam-1].get_with_ts()
+            if fr is None or ts == last_frame_ts:
                 time.sleep(0.01)
                 continue
+            last_frame_ts = ts
 
             fr_roi=_apply_roi(cam, fr)
             fr_alpr=_preprocess_for_alpr(cam, fr_roi)
