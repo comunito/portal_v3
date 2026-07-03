@@ -644,8 +644,10 @@ class VideoSource:
                 except Exception:
                     pass
 
-                last=time.time()
+                frame_skip = 3
                 while self.running:
+                    for _ in range(frame_skip - 1):
+                        cap.grab()
                     ok, fr = cap.read()
                     thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
                     if not ok or fr is None: break
