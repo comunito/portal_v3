@@ -1,5 +1,5 @@
 from __future__ import annotations
-from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for
+from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for, send_file
 import cv2, threading, time, os, json, csv, requests, subprocess, re, datetime, base64, queue, glob
 import numpy as np
 from collections import OrderedDict
@@ -9,6 +9,36 @@ from zoneinfo import ZoneInfo
 import socket
 from urllib.parse import urlparse
 import ipaddress
+import sys
+import traceback
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(script_dir, "portal_history.csv")
+CRASH_LOG = os.path.join(script_dir, "crash.log")
+thread_heartbeats = {}
+
+def _iso_now_early():
+    try:
+        tz = globals().get("TZ")
+        if tz:
+            return datetime.datetime.now(tz=tz).isoformat()
+    except Exception:
+        pass
+    return datetime.datetime.now().isoformat()
+
+def crash_handler(etype, value, tb):
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n--- CRASH AT {_iso_now_early()} ---\n")
+            traceback.print_exception(etype, value, tb, file=f)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+    sys.__excepthook__(etype, value, tb)
+
+sys.excepthook = crash_handler
+
 
 # Limitar hilos de librerías matemáticas ANTES de que cualquier thread los herede
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -420,6 +450,7 @@ class GateSerialManager:
 
     def _loop(self):
         while True:
+            thread_heartbeats["gate_serial"] = time.time()
             # Preferencia: si alguna cam define gate_serial_device, úsala
             preferred=""
             baud=115200
@@ -610,6 +641,7 @@ class VideoSource:
                 last=time.time()
                 while self.running:
                     ok, fr = cap.read()
+                    thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
                     if not ok or fr is None: break
 
                     try:
@@ -930,17 +962,60 @@ def _build_tag_idx_from_rows(cam:int, rows:list[list[str]])->str:
                 idx[key]=row
     return f"Índice TAG owners cam{cam}: {added} (+{replaced}) de {total} filas"
 
+def _local_cache_path(cam:int, kind:str)->str:
+    return os.path.join(script_dir, f"cache_wl_cam{cam}_{kind}.json")
+
+def _local_tag_cache_path(cam:int)->str:
+    return os.path.join(script_dir, f"cache_tag_wl_cam{cam}_owners.json")
+
+def _load_wl_from_cache():
+    for cam in (1,2):
+        for kind in ("owners", "visitors"):
+            cache_path = _local_cache_path(cam, kind)
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        rows = json.load(f)
+                    msg = _build_idx_from_rows(cam, kind, rows)
+                    print(f"[CACHE LOAD] {msg} (desde caché local)")
+                except Exception as e:
+                    print(f"[CACHE LOAD ERROR] cam{cam} {kind}: {e}")
+        # Tags
+        cache_path = _local_tag_cache_path(cam)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    rows = json.load(f)
+                msg = _build_tag_idx_from_rows(cam, rows)
+                print(f"[CACHE LOAD] {msg} (desde caché local)")
+            except Exception as e:
+                print(f"[CACHE LOAD ERROR] cam{cam} tags: {e}")
+
 def download_wl(cam:int, kind:str)->str:
     c=cfg["cameras"][cam-1][kind]
     url=_gs_url(c.get("sheets_input",""))
     if not url: return f"❌ Configura '{kind}.sheets_input'"
     try:
         r=requests.get(url, timeout=25)
-        if r.status_code!=200: return f"❌ HTTP {r.status_code} descargando CSV"
+        if r.status_code!=200:
+            msg = f"❌ HTTP {r.status_code} descargando CSV"
+            print(f"[WHITELIST ERROR][cam{cam}] {kind}: {msg}")
+            return msg
         rows=_parse_csv_text(r.text)
     except Exception as e:
-        return f"❌ Error WL: {e}"
+        msg = f"❌ Error WL: {e}"
+        print(f"[WHITELIST ERROR][cam{cam}] {kind}: {msg}")
+        return msg
     msg=_build_idx_from_rows(cam,kind,rows)
+    print(f"[WHITELIST][cam{cam}] {msg}")
+    
+    try:
+        cache_path = _local_cache_path(cam, kind)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+    except Exception as ce:
+        print(f"[CACHE WRITE ERROR] cam{cam} {kind}: {ce}")
+        
     _last_wl[cam-1][kind]=time.time()
     return msg
 
@@ -950,11 +1025,25 @@ def download_tag_wl(cam:int)->str:
     if not url: return f"❌ Configura 'tags.owners.sheets_input'"
     try:
         r=requests.get(url, timeout=25)
-        if r.status_code!=200: return f"❌ HTTP {r.status_code} descargando CSV"
+        if r.status_code!=200:
+            msg = f"❌ HTTP {r.status_code} descargando CSV"
+            print(f"[WHITELIST ERROR][cam{cam}] tags: {msg}")
+            return msg
         rows=_parse_csv_text(r.text)
     except Exception as e:
-        return f"❌ Error TAG WL: {e}"
+        msg = f"❌ Error TAG WL: {e}"
+        print(f"[WHITELIST ERROR][cam{cam}] tags: {msg}")
+        return msg
     msg=_build_tag_idx_from_rows(cam,rows)
+    print(f"[WHITELIST][cam{cam}] {msg}")
+    
+    try:
+        cache_path = _local_tag_cache_path(cam)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+    except Exception as ce:
+        print(f"[CACHE WRITE ERROR] cam{cam} tags: {ce}")
+        
     _last_tag_wl[cam-1]["owners"]=time.time()
     return msg
 
@@ -1103,9 +1192,10 @@ class SendManager:
     def _send_to_endpoint(self, sess:requests.Session, url, payload, snap_bytes, mode):
         url=(url or "").strip()
         if not url: return False, "no-url"
+        mode_lower = (mode or "multipart").lower().strip()
         try:
             if snap_bytes is not None:
-                if (mode or "multipart").lower()=="json":
+                if mode_lower == "json":
                     js=dict(payload)
                     js["snapshot_b64"]=base64.b64encode(snap_bytes).decode("ascii")
                     r=sess.post(url, json=js, timeout=8)
@@ -1113,15 +1203,23 @@ class SendManager:
                     files={"snapshot": ("snapshot.jpg", snap_bytes, "image/jpeg")}
                     r=sess.post(url, data=payload, files=files, timeout=8)
             else:
-                r=sess.post(url, json=payload, timeout=8)
-            return (r.status_code==200), f"HTTP {r.status_code}"
+                if mode_lower == "json":
+                    r=sess.post(url, json=payload, timeout=8)
+                else:
+                    r=sess.post(url, data=payload, timeout=8)
+            return (200 <= r.status_code < 400), f"HTTP {r.status_code}"
         except Exception as e:
             return False, str(e)
 
     def _loop(self):
         sess=requests.Session()
         while True:
-            item=self.q.get()
+            try:
+                item=self.q.get(timeout=2.0)
+            except queue.Empty:
+                thread_heartbeats[f"send_mgr_cam{self.cam}"] = time.time()
+                continue
+            thread_heartbeats[f"send_mgr_cam{self.cam}"] = time.time()
             try:
                 endpoints=item["endpoints"]
                 payload=item["payload"]
@@ -1139,8 +1237,12 @@ class SendManager:
                     if not (url or "").strip():
                         continue
                     snap = (snap_jpeg if (send_snap and snap_jpeg is not None) else None)
-                    ok,_=self._send_to_endpoint(sess, url, payload, snap, mode)
-                    any_ok = any_ok or ok
+                    ok, err_msg = self._send_to_endpoint(sess, url, payload, snap, mode)
+                    if ok:
+                        print(f"[WEBHOOK][cam{self.cam}] Webhook enviado con éxito a {url} (Resp: {err_msg})")
+                        any_ok = True
+                    else:
+                        print(f"[WEBHOOK ERROR][cam{self.cam}] Error al enviar webhook a {url}: {err_msg}")
                 if any_ok:
                     self.sent += 1
             finally:
@@ -1257,6 +1359,7 @@ def _motion_loop(cam:int):
     cooldown=float(max(0.2, c.get("cooldown_s",2.0)))
     last_check=0.0
     while True:
+        thread_heartbeats[f"motion_cam{cam}"] = time.time()
         try:
             if not cfg["cameras"][cam-1]["motion"].get("enabled",True):
                 motion[cam-1].active=True; time.sleep(0.2); continue
@@ -1381,6 +1484,31 @@ def _iso_now():
         return datetime.datetime.now(tz=TZ).isoformat()
     except Exception:
         return datetime.datetime.now().isoformat()
+
+def log_event(event_type, cam, identifier, confidence, category, user_type, auth, display_vals):
+    import csv
+    row = [
+        _iso_now(),
+        event_type,
+        f"CAM{cam}",
+        identifier,
+        f"{confidence:.2f}" if isinstance(confidence, float) else str(confidence),
+        category,
+        user_type,
+        "AUTORIZADO" if auth else "DENEGADO",
+        ";".join(display_vals)
+    ]
+    try:
+        exists = os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not exists:
+                writer.writerow(["Fecha/Hora", "Tipo", "Cámara", "Identificador", "Confianza", "Categoría", "Tipo Usuario", "Autorización", "Detalles"])
+            writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        print("[LOG ERROR] No se pudo escribir en el log local:", e)
 
 def _safe_hostname():
     try:
@@ -1529,7 +1657,12 @@ class HeartbeatManager:
         sess = requests.Session()
         while True:
             try:
-                item = self.q.get()
+                try:
+                    item = self.q.get(timeout=2.0)
+                except queue.Empty:
+                    thread_heartbeats["heartbeat_sender"] = time.time()
+                    continue
+                thread_heartbeats["heartbeat_sender"] = time.time()
                 try:
                     hb_status["pending"] = int(self.q.qsize())
                     # Solo si está habilitado + URL + periodo >0 o si es "manual"
@@ -1600,6 +1733,7 @@ def _alpr_loop(cam:int):
     k=0
     last_frame_ts=0.0
     while True:
+        thread_heartbeats[f"alpr_cam{cam}"] = time.time()
         try:
             fr, ts = grab[cam-1].get_with_ts()
             if fr is None or ts == last_frame_ts:
@@ -1644,90 +1778,104 @@ def _alpr_loop(cam:int):
 
             text, conf, det_conf = results[0]
 
-            if det_conf < float(cdict.get("det_min_confidence",0.80)):
-                _stable_state[cam-1]["last"]=""
-                _stable_state[cam-1]["hits"]=0
+            if det_conf < float(cdict.get("det_min_confidence", 0.80)):
+                _stable_state[cam-1]["last"] = ""
+                _stable_state[cam-1]["hits"] = 0
                 time.sleep(0.05)
                 continue
 
-            if conf < float(cdict.get("min_confidence",0.9)):
-                _stable_state[cam-1]["last"]=""
-                _stable_state[cam-1]["hits"]=0
+            min_conf = float(cdict.get("min_confidence", 0.85))
+            if conf < min_conf:
+                _stable_state[cam-1]["last"] = ""
+                _stable_state[cam-1]["hits"] = 0
                 time.sleep(0.05)
                 continue
 
             key = canon_plate(text)
+            
+            # --- CONSULTA PREVIA DE WHITELIST PARA RESPUESTA INMEDIATA (AGILIZACIÓN) ---
+            # Para placas que ya están en la lista y autorizadas, disparamos en el PRIMER hit
+            # Para placas no encontradas (NoFound), requerimos lecturas estables consecutivas para evitar spam
+            user_type, row = lookup_row(cam, text)
+            disp_vals = ["","",""]
+            titles = ["Folio","Nombre","Telefono"]
+            auth = False
+
+            if user_type == "PROPIETARIO":
+                sec = cdict["owners"]
+                auth = is_active_from_row(sec, row)
+                disp_vals = _extract_fields(row, sec.get("disp_cols"))
+                titles = sec.get("disp_titles", titles)
+                pair = sec["wh_active"] if auth else sec["wh_inactive"]
+                cat = "ACTIVE" if auth else "INACTIVE"
+            elif user_type == "VISITA":
+                sec = cdict["visitors"]
+                auth = is_active_from_row(sec, row)
+                disp_vals = _extract_fields(row, sec.get("disp_cols"))
+                titles = sec.get("disp_titles", titles)
+                pair = sec["wh_active"] if auth else sec["wh_inactive"]
+                cat = "ACTIVE" if auth else "INACTIVE"
+            else:
+                pair = cdict["wh_notfound"]
+                cat = "NOTFOUND"
+
+            # Determinar cantidad de hits requeridos
+            if auth:
+                needed = 1  # ¡Apertura inmediata e instantánea!
+            else:
+                if user_type == "NONE":
+                    needed = int(cdict.get("notfound_stable_hits_required", 3))
+                else:
+                    needed = int(cdict.get("stable_hits_required", 2))
+                # Si la confianza es extremadamente alta, permitimos 1 hit de confirmación
+                if conf >= 0.93 and det_conf >= 0.85:
+                    needed = 1
+
             if key == _stable_state[cam-1]["last"]:
                 _stable_state[cam-1]["hits"] += 1
             else:
                 _stable_state[cam-1]["last"] = key
                 _stable_state[cam-1]["hits"] = 1
 
-            needed = int(cdict.get("stable_hits_required",2))
-            if conf >= 0.93 and det_conf >= 0.85: needed = 1
-
             if _stable_state[cam-1]["hits"] < needed:
                 time.sleep(0.01)
                 continue
 
-            user_type, row = lookup_row(cam, text)
-            disp_vals=["","",""]
-            titles=["Folio","Nombre","Telefono"]
-            auth=False
-
+            # Suprimir NoFound repetidos por unos segundos después de una lectura válida
             if user_type == "NONE":
-                needed = int(cdict.get("notfound_stable_hits_required",4))
-                if conf >= 0.93 and det_conf >= 0.85: needed = 1
-
-            if _stable_state[cam-1]["hits"] < needed:
-                time.sleep(0.01)
-                continue
-
-            # suprimir NoFound por unos segundos después de lectura válida
-            if user_type == "NONE":
-                sup = int(cdict.get("suppress_notfound_after_auth_sec",8))
+                sup = int(cdict.get("suppress_notfound_after_auth_sec", 8))
                 if sup > 0 and (time.time() - _last_auth_ts[cam-1]) < sup:
                     time.sleep(0.01)
                     continue
 
-            if user_type=="PROPIETARIO":
+            # Registrar tiempo de última autorización exitosa para supresión
+            if auth:
                 _last_auth_ts[cam-1] = time.time()
-                sec=cdict["owners"]
-                auth=is_active_from_row(sec,row)
-                disp_vals=_extract_fields(row, sec.get("disp_cols"))
-                titles=sec.get("disp_titles",titles)
-                pair=sec["wh_active"] if auth else sec["wh_inactive"]
-                cat="ACTIVE" if auth else "INACTIVE"
-            elif user_type=="VISITA":
-                _last_auth_ts[cam-1] = time.time()
-                sec=cdict["visitors"]
-                auth=is_active_from_row(sec,row)
-                disp_vals=_extract_fields(row, sec.get("disp_cols"))
-                titles=sec.get("disp_titles",titles)
-                pair=sec["wh_active"] if auth else sec["wh_inactive"]
-                cat="ACTIVE" if auth else "INACTIVE"
-            else:
-                pair=cdict["wh_notfound"]
-                cat="NOTFOUND"
 
-            if auth and cdict.get("gate_enabled",False) and cdict.get("gate_auto_on_auth",False):
+            # Disparar apertura de la barrera física de inmediato
+            if auth and cdict.get("gate_enabled", False) and cdict.get("gate_auto_on_auth", False):
                 if gate_can_fire(cam):
                     gate_fire(cam)
 
-            if user_type!="NONE":
+            # Enviar Webhooks correspondientes
+            if user_type != "NONE":
                 enqueue_webhooks(cam, cat, pair, user_type, "Placa", text, disp_vals, titles)
             else:
                 enqueue_webhooks(cam, "NOTFOUND", pair, "NoFound", "Placa", text, ["","",""], ["Folio","Nombre","Telefono"])
 
+            # Actualizar estado de la interfaz web
             with slock[cam-1]:
-                states[cam-1]["plate"]=text
-                states[cam-1]["conf"]=float(conf)
-                states[cam-1]["ts"]=time.time()
-                states[cam-1]["auth"]=bool(auth)
-                states[cam-1]["cat"]=cat
-                states[cam-1]["display"]=disp_vals
-                states[cam-1]["titles"]=titles
-                states[cam-1]["user_type"]=user_type
+                states[cam-1]["plate"] = text
+                states[cam-1]["conf"] = float(conf)
+                states[cam-1]["ts"] = time.time()
+                states[cam-1]["auth"] = bool(auth)
+                states[cam-1]["cat"] = cat
+                states[cam-1]["display"] = disp_vals
+                states[cam-1]["titles"] = titles
+                states[cam-1]["user_type"] = user_type
+
+            # Registrar en el log local permanente (inmune a fallas)
+            log_event("PLACA", cam, text, float(conf), cat, user_type, auth, disp_vals)
 
             time.sleep(0.005)
 
@@ -1781,6 +1929,7 @@ HOME = """
     {% endfor %}
     <div style="flex:1"></div>
     <a class="btn" href="/wifi" style="margin-right:8px;background:#17a2b8;color:#fff;text-decoration:none">📡 WiFi</a>
+    <a class="btn" href="/logs" style="margin-right:8px;background:#28a745;color:#fff;text-decoration:none">📝 Logs</a>
     <a class="btn" href="/settings">⚙️ Settings</a>
   </div>
 </div>
@@ -2240,46 +2389,21 @@ SETTINGS_CAM = """
     <div class="muted">Define ROI en <a class="a" href="/roi?cam={{cam}}" target="_blank">/roi?cam={{cam}}</a></div>
   </div>
 
-  <h3>Procesamiento ALPR</h3>
-  <div class="grid4">
-    <label>Procesar cada N frames<br><input type="number" step="1" name="process_every_n" value="{{c.process_every_n}}"></label>
-    <label>Max ancho (px)<br><input type="number" step="10" name="resize_max_w" value="{{c.resize_max_w}}"></label>
-    <label>Top-K<br><input type="number" step="1" name="alpr_topk" value="{{c.alpr_topk}}"></label>
-    <label>Umbral conf (%)<br><input type="number" step="1" name="min_conf_pct" value="{{(c.min_confidence*100)|round(0,'floor')}}"></label>
-    <label>Idle clear (s)<br><input type="number" step="0.1" name="idle_clear_sec" value="{{c.idle_clear_sec}}"></label>
+  <div class="subsec hl" style="margin-top: 15px;">
+    <b>⚙️ Rendimiento y Optimización de IA (Autopreparado)</b>
+    <div class="muted" style="margin-top: 5px; line-height: 1.4;">
+      El portal ha sido configurado en su <b>configuración base óptima</b> para Raspberry Pi 5. Los parámetros de red neuronal, tamaño de red (800px), confianza mínima (85%), filtrado bilateral lento (desactivado) y tasa de frames han sido bloqueados en el sistema para garantizar el funcionamiento más veloz y estable del procesador.
+    </div>
   </div>
 
-  
-  <h3>Pre-procesado (solo ALPR, NO afecta Snapshot/Stream)</h3>
-  <div class="grid4">
-    <label><input type="checkbox" name="pp_enabled" {{'checked' if c.pp_enabled else ''}}> Habilitar</label>
-    <label>Perfil<br>
-      <select name="pp_profile">
-        <option value="none" {{'selected' if c.pp_profile=='none' else ''}}>none (sin cambios)</option>
-        <option value="adaptive_auto" {{'selected' if c.pp_profile=='adaptive_auto' else ''}}>🔄 Adaptativo Día/Noche (recomendado)</option>
-        <option value="bw_hicontrast_sharp" {{'selected' if c.pp_profile=='bw_hicontrast_sharp' else ''}}>B/N alto contraste + nitidez</option>
-        <option value="darkfighter" {{'selected' if c.pp_profile=='darkfighter' else ''}}>Darkfighter (Bilateral+CLAHE+Gamma)</option>
-      </select>
-    </label>
-    <label>CLAHE clipLimit (1.0-4.0)<br>
-      <input type="number" step="0.1" name="pp_clahe_clip" value="{{c.pp_clahe_clip}}">
-    </label>
-    <label>Nitidez (0.0-1.2)<br>
-      <input type="number" step="0.05" name="pp_sharp_strength" value="{{c.pp_sharp_strength}}">
+  <h3>Motion gating (Detección de Movimiento)</h3>
+  <div class="grid">
+    <label><input type="checkbox" name="motion_enabled" {{'checked' if c.motion.enabled else ''}}> Habilitar Detección de Movimiento en ROI</label>
+    <label>Umbral cambio pix (%)<br>
+      <input type="number" step="0.1" name="motion_pixel_change_pct" value="{{c.motion.pixel_change_pct}}">
     </label>
   </div>
-  <div class="muted">Solo afecta el frame que entra a ALPR (respeta process_every_n). Snapshots/stream quedan intactos.</div>
-
-<h3>Motion gating (en ROI)</h3>
-  <div class="grid4">
-    <label><input type="checkbox" name="motion_enabled" {{'checked' if c.motion.enabled else ''}}> Habilitar</label>
-    <label>Umbral cambio pix (%)<br><input type="number" step="0.1" name="motion_pixel_change_pct" value="{{c.motion.pixel_change_pct}}"></label>
-    <label>Δ intensidad (0-255)<br><input type="number" step="1" name="motion_intensity_delta" value="{{c.motion.intensity_delta}}"></label>
-    <label>Recalibrar (min)<br><input type="number" step="1" name="motion_autobase_every_min" value="{{c.motion.autobase_every_min}}"></label>
-    <label>Muestras baseline<br><input type="number" step="1" name="motion_autobase_samples" value="{{c.motion.autobase_samples}}"></label>
-    <label>Intervalo muestras (s)<br><input type="number" step="0.1" name="motion_autobase_interval_s" value="{{c.motion.autobase_interval_s}}"></label>
-    <label>Cooldown (s)<br><input type="number" step="0.1" name="motion_cooldown_s" value="{{c.motion.cooldown_s}}"></label>
-  </div>
+  <div class="muted">Si se habilita, la Inteligencia Artificial solo procesará imágenes cuando se detecte movimiento dentro de la zona de interés (ROI). El umbral define qué porcentaje de píxeles debe cambiar para activarse (típico: 2.0% a 8.0%).</div>
 
   <h3>Gate / ESP32</h3>
   <div class="grid">
@@ -2571,38 +2695,32 @@ def settings_cam(cam:int):
         c["camera_url"]=request.form.get("camera_url", c.get("camera_url",""))
         c["roi"]["enabled"]=bool(request.form.get("roi_enabled"))
 
-        # ALPR
-        c["process_every_n"]=_clampi(request.form.get("process_every_n", c.get("process_every_n",2)),1,30,c.get("process_every_n",2))
-        c["resize_max_w"]=_clampi(request.form.get("resize_max_w", c.get("resize_max_w",1280)),64,4096,c.get("resize_max_w",1280))
-        c["alpr_topk"]=_clampi(request.form.get("alpr_topk", c.get("alpr_topk",3)),1,5,c.get("alpr_topk",3))
-        try:
-            pct=float(request.form.get("min_conf_pct", c.get("min_confidence",0.9)*100.0))/100.0
-            c["min_confidence"]=_clampf(pct,0,1,c.get("min_confidence",0.9))
-        except: pass
-        try:
-            c["idle_clear_sec"]=max(0.5, float(request.form.get("idle_clear_sec", c.get("idle_clear_sec",1.5))))
-        except: pass
+        # ALPR (Valores optimizados forzados)
+        c["process_every_n"] = 4       # Procesar cada 4 frames (7.5 FPS a 30 FPS de la cámara)
+        c["resize_max_w"] = 800        # Resolución de red óptima
+        c["alpr_topk"] = 1             # Solo necesitamos 1 candidato
+        c["min_confidence"] = 0.85     # Umbral del 85% de confianza mínima
+        c["idle_clear_sec"] = 2.0      # Borrar del display a los 2 segundos de inactividad
 
-        # Pre-procesado (solo ALPR)
-        c["pp_enabled"]=bool(request.form.get("pp_enabled"))
-        c["pp_profile"]=(request.form.get("pp_profile", c.get("pp_profile","none")) or "none").strip().lower()
-        if c["pp_profile"] not in ("none","bw_hicontrast_sharp","darkfighter","adaptive_auto"):
-            c["pp_profile"]="none"
-        c["pp_clahe_clip"]=_clampf(request.form.get("pp_clahe_clip", c.get("pp_clahe_clip",2.0)), 1.0, 4.0, c.get("pp_clahe_clip",2.0))
-        c["pp_sharp_strength"]=_clampf(request.form.get("pp_sharp_strength", c.get("pp_sharp_strength",0.55)), 0.0, 1.2, c.get("pp_sharp_strength",0.55))
+        # Pre-procesado (Forzar apagado para no saturar la CPU)
+        c["pp_enabled"] = False
+        c["pp_profile"] = "none"
+        c["pp_clahe_clip"] = 2.0
+        c["pp_sharp_strength"] = 0.55
 
-        # Motion
-        m=c["motion"]
-        m["enabled"]=bool(request.form.get("motion_enabled"))
-        try: m["pixel_change_pct"]=float(request.form.get("motion_pixel_change_pct", m.get("pixel_change_pct",2.0)))
-        except: pass
-        m["intensity_delta"]=_clampi(request.form.get("motion_intensity_delta", m.get("intensity_delta",25)), 1, 255, m.get("intensity_delta",25))
-        m["autobase_every_min"]=_clampi(request.form.get("motion_autobase_every_min", m.get("autobase_every_min",10)),1,1440,m.get("autobase_every_min",10))
-        m["autobase_samples"]=_clampi(request.form.get("motion_autobase_samples", m.get("autobase_samples",3)),1,5,m.get("autobase_samples",3))
-        try: m["autobase_interval_s"]=max(0.2, float(request.form.get("motion_autobase_interval_s", m.get("autobase_interval_s",1.0))))
-        except: pass
-        try: m["cooldown_s"]=max(0.2, float(request.form.get("motion_cooldown_s", m.get("cooldown_s",2.0))))
-        except: pass
+        # Motion (Valores optimizados para evitar falsos positivos y spam)
+        m = c["motion"]
+        m["enabled"] = bool(request.form.get("motion_enabled"))
+        try:
+            m["pixel_change_pct"] = float(request.form.get("motion_pixel_change_pct", m.get("pixel_change_pct", 5.0)))
+        except:
+            m["pixel_change_pct"] = 5.0
+        if m["enabled"]:
+            m["intensity_delta"] = 25
+            m["autobase_every_min"] = 10
+            m["autobase_samples"] = 3
+            m["autobase_interval_s"] = 1.0
+            m["cooldown_s"] = 2.0
 
         # Gate
         c["gate_enabled"]=bool(request.form.get("gate_enabled"))
@@ -3077,6 +3195,8 @@ def api_tag_event():
         tag_states[cam-1]["user_type"]=user_type
         tag_states[cam-1]["fields"]=disp_vals
 
+    log_event("TAG", cam, pkey, 1.00, cat, user_type, auth, disp_vals)
+
     # Webhooks tags
     if user_type=="PROPIETARIO":
         enqueue_webhooks(cam, cat, pair, user_type, "Tag", pkey, disp_vals, titles)
@@ -3337,13 +3457,257 @@ def api_wifi_connect():
     code, out = sh(cmd)
     return jsonify({"ok":(code==0), "error":out if code!=0 else ""})
 
+# ========== Logs & Diagnóstico ==========
+@app.route("/logs")
+def view_logs():
+    import csv
+    logs = []
+    headers = ["Fecha/Hora", "Tipo", "Cámara", "Identificador", "Confianza", "Categoría", "Tipo Usuario", "Autorización", "Detalles"]
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+                if len(rows) > 1:
+                    headers = rows[0]
+                    logs = rows[1:][-300:]
+                    logs.reverse()
+    except Exception as e:
+        print("Error leyendo logs:", e)
+
+    now = time.time()
+    thread_status = []
+    for name, ts in sorted(thread_heartbeats.items()):
+        diff = now - ts
+        status = "ACTIVO" if diff < 45 else "INACTIVO/CONGELADO"
+        color = "#10b981" if diff < 45 else "#ef4444"
+        thread_status.append({
+            "name": name,
+            "last_seen": f"{diff:.1f}s atrás",
+            "status": status,
+            "color": color
+        })
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Historial de Eventos - Comunito Portal</title>
+      <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#f8fafc;color:#1e293b}
+        h1{margin:0 0 12px;font-weight:800;letter-spacing:-0.5px;color:#0f172a;font-size:26px}
+        .btn{padding:8px 14px;border:none;border-radius:8px;background:#cbd5e1;cursor:pointer;font-weight:600;font-size:13px;color:#334155;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;margin-right:8px}
+        .btn:hover{background:#94a3b8;transform:translateY(-1px)}
+        .btn-primary{background:#2563eb;color:#fff}
+        .btn-primary:hover{background:#1d4ed8}
+        .btn-danger{background:#ef4444;color:#fff}
+        .btn-danger:hover{background:#dc2626}
+        .card{border:1px solid #e2e8f0;border-radius:16px;padding:20px;background:#fff;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05);margin-bottom:20px}
+        .card h3{margin:0 0 12px 0;font-size:16px;color:#0f172a;border-bottom:1px solid #f1f5f9;padding-bottom:8px}
+        table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
+        th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #f1f5f9}
+        th{background:#f8fafc;font-weight:700;color:#475569}
+        tr:hover{background:#f8fafc}
+        .badge{padding:3px 8px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase}
+        .badge-active{background:#dcfce7;color:#15803d}
+        .badge-inactive{background:#fee2e2;color:#b91c1c}
+        .badge-notfound{background:#f1f5f9;color:#475569}
+        .badge-auth{background:#dcfce7;color:#15803d}
+        .badge-denied{background:#fee2e2;color:#b91c1c}
+        .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+      </style>
+    </head>
+    <body>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+        <h1>📝 Historial de Operación y Diagnóstico</h1>
+        <div>
+          <a class="btn btn-primary" href="/">🏠 Volver al Inicio</a>
+          <a class="btn" href="/logs/download">📥 Descargar CSV Completo</a>
+          <a class="btn" href="/crash/view">⚠️ Ver Log de Crashes</a>
+          <a class="btn btn-danger" href="/logs/clear" onclick="return confirm('¿Seguro que deseas borrar el historial?')">🗑️ Borrar Historial</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>⚡ Estado de Hilos del Sistema (Watchdog)</h3>
+        <div style="display:flex;flex-wrap:wrap;gap:16px">
+          {% for th in thread_status %}
+            <div style="background:#f8fafc;padding:8px 12px;border-radius:8px;border:1px solid #e2e8f0;font-size:12px;min-width:180px">
+              <span class="status-dot" style="background:{{th.color}}"></span>
+              <b>{{th.name}}</b><br>
+              <span class="muted" style="color:#64748b">Estado: {{th.status}} ({{th.last_seen}})</span>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>🚗 Últimos 300 Eventos Registrados</h3>
+        <table>
+          <thead>
+            <tr>
+              {% for h in headers %}
+                <th>{{h}}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in logs %}
+              <tr>
+                {% for cell in row %}
+                  <td>
+                    {% if cell == 'ACTIVE' or cell == 'PROPIETARIO' or cell == 'VISITA' %}
+                      <span class="badge badge-active">{{cell}}</span>
+                    {% elif cell == 'INACTIVE' %}
+                      <span class="badge badge-inactive">{{cell}}</span>
+                    {% elif cell == 'NOTFOUND' or cell == 'NONE' or cell == 'NoFound' %}
+                      <span class="badge badge-notfound">{{cell}}</span>
+                    {% elif cell == 'AUTORIZADO' %}
+                      <span class="badge badge-auth">{{cell}}</span>
+                    {% elif cell == 'DENEGADO' %}
+                      <span class="badge badge-denied">{{cell}}</span>
+                    {% else %}
+                      {{cell}}
+                    {% endif %}
+                  </td>
+                {% endfor %}
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="9" style="text-align:center;color:#64748b;padding:20px">No hay eventos registrados en el log local.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html, headers=headers, logs=logs, thread_status=thread_status)
+
+@app.route("/logs/download")
+def download_logs():
+    if os.path.exists(LOG_FILE):
+        return send_file(LOG_FILE, as_attachment=True, download_name="portal_history.csv")
+    return "No hay archivo de log disponible", 404
+
+@app.route("/logs/clear")
+def clear_logs():
+    try:
+        if os.path.exists(LOG_FILE):
+            os.remove(LOG_FILE)
+        return redirect("/logs")
+    except Exception as e:
+        return f"Error borrando archivo de logs: {e}", 500
+
+@app.route("/crash/view")
+def view_crash_log():
+    content = "No se ha registrado ningún crash en el sistema."
+    try:
+        if os.path.exists(CRASH_LOG):
+            with open(CRASH_LOG, "r", encoding="utf-8") as f:
+                content = f.read()
+    except Exception as e:
+        content = f"Error leyendo log de crashes: {e}"
+        
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Log de Crashes - Comunito Portal</title>
+      <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#f8fafc;color:#1e293b}
+        h1{margin:0 0 12px;font-weight:800;letter-spacing:-0.5px;color:#0f172a;font-size:26px}
+        .btn{padding:8px 14px;border:none;border-radius:8px;background:#cbd5e1;cursor:pointer;font-weight:600;font-size:13px;color:#334155;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
+        .btn:hover{background:#94a3b8;transform:translateY(-1px)}
+        .btn-primary{background:#2563eb;color:#fff}
+        .btn-primary:hover{background:#1d4ed8}
+        .btn-danger{background:#ef4444;color:#fff}
+        .btn-danger:hover{background:#dc2626}
+        pre{background:#0f172a;color:#cbd5e1;padding:20px;border-radius:12px;font-family:"SF Mono",ui-monospace,monospace;font-size:13px;overflow-x:auto;box-shadow:inset 0 2px 4px rgba(0,0,0,0.1);max-height:600px}
+      </style>
+    </head>
+    <body>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+        <h1>⚠️ Log de Diagnóstico de Crashes y Congelamientos</h1>
+        <div>
+          <a class="btn btn-primary" href="/logs">📋 Volver a Logs</a>
+          <a class="btn" href="/crash/download">📥 Descargar Log</a>
+          <a class="btn btn-danger" href="/crash/clear" onclick="return confirm('¿Seguro que deseas borrar el registro de crashes?')">🗑️ Limpiar Log</a>
+        </div>
+      </div>
+      <pre>{{content}}</pre>
+    </body>
+    </html>
+    """
+    return render_template_string(html, content=content)
+
+@app.route("/crash/download")
+def download_crash_log():
+    if os.path.exists(CRASH_LOG):
+        return send_file(CRASH_LOG, as_attachment=True, download_name="crash.log")
+    return "No hay archivo de crash disponible", 404
+
+@app.route("/crash/clear")
+def clear_crash_log():
+    try:
+        if os.path.exists(CRASH_LOG):
+            os.remove(CRASH_LOG)
+        return redirect("/crash/view")
+    except Exception as e:
+        return f"Error borrando archivo de logs de crash: {e}", 500
+
+def notify_watchdog():
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return
+    if sock_path.startswith("@"):
+        sock_path = "\0" + sock_path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(sock_path)
+            s.sendall(b"WATCHDOG=1")
+    except Exception:
+        pass
+
+def _watchdog_thread():
+    time.sleep(10)
+    for k in list(thread_heartbeats.keys()):
+        thread_heartbeats[k] = time.time()
+        
+    while True:
+        time.sleep(5)
+        now = time.time()
+        stuck_threads = []
+        for name, ts in thread_heartbeats.items():
+            if now - ts > 45:
+                stuck_threads.append(name)
+        
+        if stuck_threads:
+            try:
+                with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                    f.write(f"\n--- WATCHDOG WARNING AT {_iso_now_early()} ---\n")
+                    f.write(f"Hilos bloqueados o inactivos: {', '.join(stuck_threads)}\n")
+                    f.write("No se enviará el ping de Watchdog a systemd para forzar el reinicio.\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+            print(f"[WATCHDOG] Hilos bloqueados: {stuck_threads}. Forzando reinicio por inactividad.")
+        else:
+            notify_watchdog()
+
 # ----- Threads -----
+_load_wl_from_cache()
 for i in (1,2):
     threading.Thread(target=_alpr_loop, args=(i,), daemon=True).start()
     threading.Thread(target=_motion_loop, args=(i,), daemon=True).start()
 threading.Thread(target=_auto_refresh_loop, daemon=True).start()
 threading.Thread(target=_sysmon_loop, daemon=True).start()
 threading.Thread(target=_heartbeat_scheduler_loop, daemon=True).start()
+threading.Thread(target=_watchdog_thread, daemon=True).start()
 
 if __name__=="__main__":
     os.environ["TZ"]="America/Mexico_City"
