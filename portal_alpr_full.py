@@ -573,8 +573,7 @@ def _ping(ip:str, timeout=1)->bool:
         return False
 
 # ========== RTSP LOW-LATENCY ==========
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = \
-    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|reorder_queue_size;0|max_delay;0|stimeout;3000000"
+# (Las opciones de FFmpeg ya se configuraron al inicio del script, antes de importar cv2)
 
 class VideoSource:
     def __init__(self, cidx:int):
@@ -597,14 +596,44 @@ class VideoSource:
     def _open_cv(self, url): return cv2.VideoCapture(url)
 
     def _open_gst(self, url):
+        """Abrir flujo RTSP con GStreamer usando decodebin (soporta H.264 Y H.265 automáticamente)."""
         if not url.lower().startswith("rtsp://"): return None
-        pipeline = (
-            f"rtspsrc location=\"{url}\" protocols=tcp latency=0 drop-on-latency=true ! "
-            "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-            "appsink sync=false max-buffers=1 drop=true"
+
+        # Pipeline universal con decodebin: autodetecta codec (H.264, H.265, MJPEG, etc.)
+        pipeline_universal = (
+            f'rtspsrc location="{url}" protocols=tcp latency=200 '
+            'drop-on-latency=true do-retransmission=false ! '
+            'decodebin ! videoconvert ! video/x-raw,format=BGR ! '
+            'appsink sync=false max-buffers=2 drop=true'
         )
-        cap=cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-        if cap is not None and cap.isOpened(): return cap
+        cap = cv2.VideoCapture(pipeline_universal, cv2.CAP_GSTREAMER)
+        if cap is not None and cap.isOpened():
+            return cap
+
+        # Fallback: pipeline explícito para H.265/HEVC
+        pipeline_h265 = (
+            f'rtspsrc location="{url}" protocols=tcp latency=200 '
+            'drop-on-latency=true do-retransmission=false ! '
+            'rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! '
+            'video/x-raw,format=BGR ! '
+            'appsink sync=false max-buffers=2 drop=true'
+        )
+        cap = cv2.VideoCapture(pipeline_h265, cv2.CAP_GSTREAMER)
+        if cap is not None and cap.isOpened():
+            return cap
+
+        # Fallback: pipeline explícito para H.264
+        pipeline_h264 = (
+            f'rtspsrc location="{url}" protocols=tcp latency=200 '
+            'drop-on-latency=true do-retransmission=false ! '
+            'rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! '
+            'video/x-raw,format=BGR ! '
+            'appsink sync=false max-buffers=2 drop=true'
+        )
+        cap = cv2.VideoCapture(pipeline_h264, cv2.CAP_GSTREAMER)
+        if cap is not None and cap.isOpened():
+            return cap
+
         return None
 
     def start(self):
@@ -629,26 +658,38 @@ class VideoSource:
             if self.last_ip and not _ping(self.last_ip,1):
                 time.sleep(0.5); continue
             cap=None
+            using_gst = False
             try:
                 cap = self._open_gst(url)
                 if cap is not None and cap.isOpened():
-                    print(f"[CAM{self.cidx+1}] Abierta con GStreamer (latencia 0)")
+                    print(f"[CAM{self.cidx+1}] ✅ Abierta con GStreamer (H.264/H.265 auto, latencia baja)")
+                    using_gst = True
                 else:
-                    print(f"[CAM{self.cidx+1}] GStreamer no disponible. Usando OpenCV FFmpeg con fflags=nobuffer...")
+                    print(f"[CAM{self.cidx+1}] ⚠️ GStreamer no disponible. Usando OpenCV FFmpeg (TCP)...")
                     cap = self._open_cv(url)
                 if not cap or not cap.isOpened():
                     time.sleep(0.6); continue
 
-                # ── Zero-Latency Buffer: entregar siempre el frame más reciente ──
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
+                # ── Zero-Latency Buffer (solo aplica a FFmpeg backend) ──
+                if not using_gst:
+                    try:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
 
+                consecutive_errors = 0
+                last = time.time()
                 while self.running:
                     ok, fr = cap.read()
                     thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
-                    if not ok or fr is None: break
+                    if not ok or fr is None:
+                        consecutive_errors += 1
+                        if consecutive_errors > 30:
+                            print(f"[CAM{self.cidx+1}] Demasiados errores de lectura, reconectando...")
+                            break
+                        time.sleep(0.01)
+                        continue
+                    consecutive_errors = 0
 
                     try:
                         mx=int(cfg["cameras"][self.cidx].get("resize_max_w",1280))
