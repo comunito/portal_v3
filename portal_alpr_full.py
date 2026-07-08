@@ -1083,6 +1083,8 @@ class SendManager:
                     any_ok = any_ok or ok
                 if any_ok:
                     self.sent += 1
+            except Exception as e:
+                print(f"[WH][cam{self.cam}] ERROR CRÍTICO en bucle de envío: {e}")
             finally:
                 self.q.task_done()
 
@@ -1109,7 +1111,20 @@ def _mark_sent(cam:int, cat:str, value:str):
 
 def _base_payload(cam:int, usuario:str, dispositivo:str, valor:str, disp_vals:list[str], titles:list[str]):
     payload = OrderedDict()
-    payload["cam"] = cam
+    
+    # Intentar obtener el nombre personalizado de la cámara en la configuración
+    cam_name = ""
+    try:
+        cdict = cfg["cameras"][cam-1]
+        cam_name = (cdict.get("camera_name") or "").strip()
+    except Exception:
+        pass
+
+    if cam_name:
+        payload["cam"] = f"{cam} - {cam_name}"
+    else:
+        payload["cam"] = cam
+
     payload["usuario"] = usuario
     payload["dispositivo"] = dispositivo
     payload["valor"] = canon_plate(valor)
@@ -2133,6 +2148,8 @@ SETTINGS_CAM = """
 
   <h3>Cámara</h3>
   <div class="grid">
+    <label style="grid-column: 1 / -1">Nombre de la Cámara (Personalizado para Bitácora)<br>
+      <input type="text" name="camera_name" value="{{c.camera_name or ''}}" placeholder="Ej. Entrada Principal, Casetón 1" style="min-width: 95%"></label>
     <label>Modo<br>
       <select name="camera_mode">
         <option value="mac" {{ 'selected' if c.camera_mode=='mac' else '' }}>Por MAC ({CAM_IP})</option>
@@ -2469,6 +2486,7 @@ def settings_cam(cam:int):
         c["wh_min_gap_sec"]=_clampi(request.form.get("wh_min_gap_sec", c.get("wh_min_gap_sec",0)),0,3600,c.get("wh_min_gap_sec",0))
 
         # Camera basics
+        c["camera_name"]=(request.form.get("camera_name") or "").strip()
         c["camera_mode"]=(request.form.get("camera_mode", c.get("camera_mode","mac")) or "mac").lower()
         c["camera_mac"]=(request.form.get("camera_mac", c.get("camera_mac","")) or "").upper().replace("-",":")
         c["camera_url"]=request.form.get("camera_url", c.get("camera_url",""))
