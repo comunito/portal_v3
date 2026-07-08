@@ -1,9 +1,6 @@
 from __future__ import annotations
-from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for, send_file
-import os
-# Configurar opciones de OpenCV FFmpeg ANTES de importar cv2 para forzar el uso de TCP y evitar pérdida de frames predictivos (pantallas grises)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|max_delay;500000|analyzeduration;500000|probesize;500000"
-import cv2, threading, time, json, csv, requests, subprocess, re, datetime, base64, queue, glob
+from flask import Flask, jsonify, render_template_string, Response, request, redirect, url_for
+import cv2, threading, time, os, json, csv, requests, subprocess, re, datetime, base64, queue, glob
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
@@ -12,41 +9,6 @@ from zoneinfo import ZoneInfo
 import socket
 from urllib.parse import urlparse
 import ipaddress
-import sys
-import traceback
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(script_dir, "portal_history.csv")
-CRASH_LOG = os.path.join(script_dir, "crash.log")
-thread_heartbeats = {}
-
-def _iso_now_early():
-    try:
-        tz = globals().get("TZ")
-        if tz:
-            return datetime.datetime.now(tz=tz).isoformat()
-    except Exception:
-        pass
-    return datetime.datetime.now().isoformat()
-
-def crash_handler(etype, value, tb):
-    try:
-        with open(CRASH_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n--- CRASH AT {_iso_now_early()} ---\n")
-            traceback.print_exception(etype, value, tb, file=f)
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception:
-        pass
-    sys.__excepthook__(etype, value, tb)
-
-sys.excepthook = crash_handler
-
-
-# Limitar hilos de librerías matemáticas ANTES de que cualquier thread los herede
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 try:
     import serial
@@ -211,7 +173,7 @@ CAM_DEF = {
     "stable_hits_required": 2,
     "notfound_stable_hits_required": 4,
     "suppress_notfound_after_auth_sec": 8,
-    "latch_hold_sec": 1.0,
+    "latch_hold_sec": 30.0,
 
     # Pre-procesado (solo ALPR, NO afecta snapshot/stream)
     "pp_enabled": False,
@@ -291,7 +253,7 @@ def load_cfg():
         c["stable_hits_required"] = _clampi(c.get("stable_hits_required",2),1,5,2)
         c["notfound_stable_hits_required"] = _clampi(c.get("notfound_stable_hits_required",4),1,10,4)
         c["suppress_notfound_after_auth_sec"] = _clampi(c.get("suppress_notfound_after_auth_sec",8),0,60,8)
-        c["latch_hold_sec"] = max(1.0, float(c.get("latch_hold_sec",1.0)))
+        c["latch_hold_sec"] = max(1.0, float(c.get("latch_hold_sec",30.0)))
 
         for sect in ("owners","visitors"):
             w = c.get(sect,{}) or {}
@@ -453,7 +415,6 @@ class GateSerialManager:
 
     def _loop(self):
         while True:
-            thread_heartbeats["gate_serial"] = time.time()
             # Preferencia: si alguna cam define gate_serial_device, úsala
             preferred=""
             baud=115200
@@ -573,9 +534,8 @@ def _ping(ip:str, timeout=1)->bool:
         return False
 
 # ========== RTSP LOW-LATENCY ==========
-# Estrategia: usar ffmpeg como subproceso directo para decodificar H.264/H.265
-# con flags de descarte de frames corruptos. Esto elimina las pantallas grises
-# que produce el decodificador integrado de OpenCV con streams HEVC por WiFi.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = \
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|reorder_queue_size;0|max_delay;0|stimeout;3000000"
 
 class VideoSource:
     def __init__(self, cidx:int):
@@ -589,78 +549,20 @@ class VideoSource:
 
     def get(self):
         with self.lock:
-            if self.frame is not None:
-                return self.frame.copy()
-            return None
+            return self.frame
 
-    def get_with_ts(self):
-        with self.lock:
-            if self.frame is not None:
-                return self.frame.copy(), self.ts
-            return None, self.ts
+    def _open_cv(self, url): return cv2.VideoCapture(url)
 
-    def _probe_resolution(self, url):
-        """Sondear resolución del flujo RTSP con ffprobe."""
-        try:
-            result = subprocess.run(
-                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                 '-show_entries', 'stream=width,height',
-                 '-of', 'csv=p=0:s=x',
-                 '-rtsp_transport', 'tcp', url],
-                capture_output=True, text=True, timeout=10
-            )
-            parts = result.stdout.strip().split('x')
-            if len(parts) == 2:
-                w, h = int(parts[0]), int(parts[1])
-                if w > 0 and h > 0:
-                    return w, h
-        except Exception as e:
-            print(f"[CAM{self.cidx+1}] ffprobe error: {e}")
-        return None, None
-
-    def _open_ffmpeg_pipe(self, url):
-        """Abrir flujo RTSP con ffmpeg subprocess.
-        Soporta H.264 Y H.265 nativamente con recuperación de errores."""
-        orig_w, orig_h = self._probe_resolution(url)
-        if not orig_w:
-            print(f"[CAM{self.cidx+1}] ffprobe no pudo detectar resolución")
-            return None, 0, 0
-
-        mx = int(cfg["cameras"][self.cidx].get("resize_max_w", 800))
-        out_w = min(mx, orig_w)
-        out_h = int(orig_h * out_w / orig_w)
-        # Asegurar dimensiones pares para ffmpeg
-        out_w -= out_w % 2
-        out_h -= out_h % 2
-
-        cmd = [
-            'ffmpeg',
-            '-rtsp_transport', 'tcp',
-            '-fflags', '+discardcorrupt+nobuffer',
-            '-flags', 'low_delay',
-            '-err_detect', 'ignore_err',
-            '-i', url,
-            '-f', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-vf', f'scale={out_w}:{out_h}',
-            '-an', '-sn',
-            '-loglevel', 'error',
-            'pipe:1'
-        ]
-
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                bufsize=out_w * out_h * 3 * 3
-            )
-            return proc, out_w, out_h
-        except Exception as e:
-            print(f"[CAM{self.cidx+1}] Error al iniciar ffmpeg: {e}")
-            return None, 0, 0
-
-    def _open_cv(self, url):
-        """Fallback: abrir con OpenCV VideoCapture."""
-        return cv2.VideoCapture(url)
+    def _open_gst(self, url):
+        if not url.lower().startswith("rtsp://"): return None
+        pipeline = (
+            f"rtspsrc location=\"{url}\" protocols=tcp latency=0 drop-on-latency=true ! "
+            "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
+            "appsink sync=false max-buffers=1 drop=true"
+        )
+        cap=cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if cap is not None and cap.isOpened(): return cap
+        return None
 
     def start(self):
         if self.running: return
@@ -683,92 +585,44 @@ class VideoSource:
             if ip: self.last_ip=ip
             if self.last_ip and not _ping(self.last_ip,1):
                 time.sleep(0.5); continue
-
-            proc = None
-            cap = None
+            cap=None
             try:
-                # ── Método principal: ffmpeg subprocess (H.264 + H.265 nativo) ──
-                proc, fw, fh = self._open_ffmpeg_pipe(url)
-                if proc and fw > 0 and fh > 0:
-                    print(f"[CAM{self.cidx+1}] ✅ Abierta con ffmpeg pipe ({fw}x{fh}, H.264/H.265 auto)")
-                    frame_size = fw * fh * 3
-                    last = time.time()
-                    while self.running:
-                        raw = proc.stdout.read(frame_size)
-                        thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
-                        if len(raw) != frame_size:
-                            print(f"[CAM{self.cidx+1}] Flujo ffmpeg interrumpido, reconectando...")
-                            break
+                print(f"[CAM{self.cidx+1}] opening via OpenCV/FFmpeg only")
+                cap=self._open_cv(url)
+                if not cap or not cap.isOpened():
+                    time.sleep(0.6); continue
 
-                        fr = np.frombuffer(raw, dtype=np.uint8).reshape((fh, fw, 3)).copy()
-
-                        with self.lock:
-                            self.frame = fr
-                            self.ts = time.time()
-
-                        if (time.time() - last) > 2.0:
-                            last = time.time()
-                            url2, ip2, _ = materialize_url(c)
-                            if ip2 and self.last_ip and ip2 != self.last_ip:
-                                break
-                        time.sleep(0.001)
-                else:
-                    # ── Fallback: OpenCV VideoCapture ──
-                    print(f"[CAM{self.cidx+1}] ⚠️ ffmpeg pipe no disponible. Usando OpenCV FFmpeg (TCP)...")
-                    cap = self._open_cv(url)
-                    if not cap or not cap.isOpened():
-                        time.sleep(0.6); continue
+                last=time.time()
+                while self.running:
+                    ok, fr = cap.read()
+                    if not ok or fr is None: break
 
                     try:
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    except Exception:
+                        mx=int(cfg["cameras"][self.cidx].get("resize_max_w",1280))
+                        if mx and fr.shape[1] > mx:
+                            h,w = fr.shape[:2]
+                            tw=mx
+                            th=int(max(36, h*(tw/float(w))))
+                            fr=cv2.resize(fr, (tw,th), interpolation=cv2.INTER_AREA)
+                    except:
                         pass
 
-                    consecutive_errors = 0
-                    last = time.time()
-                    while self.running:
-                        ok, fr = cap.read()
-                        thread_heartbeats[f"grab_cam{self.cidx+1}"] = time.time()
-                        if not ok or fr is None:
-                            consecutive_errors += 1
-                            if consecutive_errors > 30:
-                                print(f"[CAM{self.cidx+1}] Demasiados errores, reconectando...")
-                                break
-                            time.sleep(0.01)
-                            continue
-                        consecutive_errors = 0
+                    with self.lock:
+                        self.frame=fr
+                        self.ts=time.time()
 
-                        try:
-                            mx=int(cfg["cameras"][self.cidx].get("resize_max_w",800))
-                            if mx and fr.shape[1] > mx:
-                                h,w = fr.shape[:2]
-                                tw=mx
-                                th=int(max(36, h*(tw/float(w))))
-                                fr=cv2.resize(fr, (tw,th), interpolation=cv2.INTER_AREA)
-                        except:
-                            pass
-
-                        with self.lock:
-                            self.frame=fr
-                            self.ts=time.time()
-
-                        if (time.time()-last)>2.0:
-                            last=time.time()
-                            url2, ip2, _ = materialize_url(c)
-                            if ip2 and self.last_ip and ip2!=self.last_ip:
-                                break
-                        time.sleep(0.001)
-            except Exception as e:
-                print(f"[CAM{self.cidx+1}] Error en captura: {e}")
+                    if (time.time()-last)>2.0:
+                        last=time.time()
+                        url2, ip2, _ = materialize_url(c)
+                        if ip2 and self.last_ip and ip2!=self.last_ip:
+                            break
+                    time.sleep(0.001)
+            except Exception:
+                pass
             finally:
-                if proc:
-                    try: proc.kill()
-                    except: pass
-                    try: proc.stdout.close()
-                    except: pass
-                if cap:
-                    try: cap.release()
-                    except: pass
+                try:
+                    if cap: cap.release()
+                except: pass
             time.sleep(0.3)
 
 grab=[VideoSource(0), VideoSource(1)]
@@ -886,58 +740,6 @@ def _preprocess_for_alpr(cam:int, frame_bgr):
         h, w = frame_bgr.shape[:2]
         if h < 20 or w < 20:
             return frame_bgr
-
-        if prof == "adaptive_auto":
-            # ── Fotómetro por software: decide automaticamente si hace falta boost ──
-            try:
-                g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            except Exception:
-                g = frame_bgr if len(frame_bgr.shape)==2 else frame_bgr
-
-            mean_lum = float(np.mean(g))
-
-            if mean_lum < 80:  # Condición nocturna / tormentosa
-                try:
-                    g = cv2.bilateralFilter(g, 9, 75, 75)
-                    table = np.array([((i / 255.0) ** (1.0 / 0.8)) * 255
-                                      for i in np.arange(0, 256)]).astype("uint8")
-                    g = cv2.LUT(g, table)
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                    g = clahe.apply(g)
-                    blur = cv2.GaussianBlur(g, (0, 0), 2.0)
-                    g = cv2.addWeighted(g, 1.5, blur, -0.5, 0)
-                except Exception:
-                    pass
-            else:  # Condición diurna: sólo nitidez suave
-                try:
-                    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-                    g = clahe.apply(g)
-                    blur = cv2.GaussianBlur(g, (0, 0), 1.0)
-                    g = cv2.addWeighted(g, 1.3, blur, -0.3, 0)
-                except Exception:
-                    pass
-
-            try:
-                return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-            except Exception:
-                return frame_bgr
-
-        if prof == "darkfighter":
-            try:
-                g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            except Exception:
-                g = frame_bgr
-            try:
-                g = cv2.bilateralFilter(g, 9, 75, 75)
-                table = np.array([((i / 255.0) ** (1.0/0.8)) * 255 for i in np.arange(0, 256)]).astype("uint8")
-                g = cv2.LUT(g, table)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-                g = clahe.apply(g)
-                blur = cv2.GaussianBlur(g, (0,0), 2.0)
-                g = cv2.addWeighted(g, 1.5, blur, -0.5, 0)
-                return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-            except Exception:
-                pass
 
         if prof == "bw_hicontrast_sharp":
             clip = _clampf(c.get("pp_clahe_clip", 2.0), 1.0, 4.0, 2.0)
@@ -1061,60 +863,17 @@ def _build_tag_idx_from_rows(cam:int, rows:list[list[str]])->str:
                 idx[key]=row
     return f"Índice TAG owners cam{cam}: {added} (+{replaced}) de {total} filas"
 
-def _local_cache_path(cam:int, kind:str)->str:
-    return os.path.join(script_dir, f"cache_wl_cam{cam}_{kind}.json")
-
-def _local_tag_cache_path(cam:int)->str:
-    return os.path.join(script_dir, f"cache_tag_wl_cam{cam}_owners.json")
-
-def _load_wl_from_cache():
-    for cam in (1,2):
-        for kind in ("owners", "visitors"):
-            cache_path = _local_cache_path(cam, kind)
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        rows = json.load(f)
-                    msg = _build_idx_from_rows(cam, kind, rows)
-                    print(f"[CACHE LOAD] {msg} (desde caché local)")
-                except Exception as e:
-                    print(f"[CACHE LOAD ERROR] cam{cam} {kind}: {e}")
-        # Tags
-        cache_path = _local_tag_cache_path(cam)
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    rows = json.load(f)
-                msg = _build_tag_idx_from_rows(cam, rows)
-                print(f"[CACHE LOAD] {msg} (desde caché local)")
-            except Exception as e:
-                print(f"[CACHE LOAD ERROR] cam{cam} tags: {e}")
-
 def download_wl(cam:int, kind:str)->str:
     c=cfg["cameras"][cam-1][kind]
     url=_gs_url(c.get("sheets_input",""))
     if not url: return f"❌ Configura '{kind}.sheets_input'"
     try:
         r=requests.get(url, timeout=25)
-        if r.status_code!=200:
-            msg = f"❌ HTTP {r.status_code} descargando CSV"
-            print(f"[WHITELIST ERROR][cam{cam}] {kind}: {msg}")
-            return msg
+        if r.status_code!=200: return f"❌ HTTP {r.status_code} descargando CSV"
         rows=_parse_csv_text(r.text)
     except Exception as e:
-        msg = f"❌ Error WL: {e}"
-        print(f"[WHITELIST ERROR][cam{cam}] {kind}: {msg}")
-        return msg
+        return f"❌ Error WL: {e}"
     msg=_build_idx_from_rows(cam,kind,rows)
-    print(f"[WHITELIST][cam{cam}] {msg}")
-    
-    try:
-        cache_path = _local_cache_path(cam, kind)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(rows, f)
-    except Exception as ce:
-        print(f"[CACHE WRITE ERROR] cam{cam} {kind}: {ce}")
-        
     _last_wl[cam-1][kind]=time.time()
     return msg
 
@@ -1124,25 +883,11 @@ def download_tag_wl(cam:int)->str:
     if not url: return f"❌ Configura 'tags.owners.sheets_input'"
     try:
         r=requests.get(url, timeout=25)
-        if r.status_code!=200:
-            msg = f"❌ HTTP {r.status_code} descargando CSV"
-            print(f"[WHITELIST ERROR][cam{cam}] tags: {msg}")
-            return msg
+        if r.status_code!=200: return f"❌ HTTP {r.status_code} descargando CSV"
         rows=_parse_csv_text(r.text)
     except Exception as e:
-        msg = f"❌ Error TAG WL: {e}"
-        print(f"[WHITELIST ERROR][cam{cam}] tags: {msg}")
-        return msg
+        return f"❌ Error TAG WL: {e}"
     msg=_build_tag_idx_from_rows(cam,rows)
-    print(f"[WHITELIST][cam{cam}] {msg}")
-    
-    try:
-        cache_path = _local_tag_cache_path(cam)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(rows, f)
-    except Exception as ce:
-        print(f"[CACHE WRITE ERROR] cam{cam} tags: {ce}")
-        
     _last_tag_wl[cam-1]["owners"]=time.time()
     return msg
 
@@ -1291,34 +1036,32 @@ class SendManager:
     def _send_to_endpoint(self, sess:requests.Session, url, payload, snap_bytes, mode):
         url=(url or "").strip()
         if not url: return False, "no-url"
-        mode_lower = (mode or "multipart").lower().strip()
         try:
+            # allow_redirects=False: Google Apps Script devuelve 302 antes de ejecutar.
+            # El POST se procesa ANTES del redirect, por eso NO seguimos el redirect
+            # (si lo seguimos, el body se pierde y el script no recibe datos).
+            # Aceptamos 200, 201, 202 y 302 como éxito.
             if snap_bytes is not None:
-                if mode_lower == "json":
+                if (mode or "multipart").lower()=="json":
                     js=dict(payload)
                     js["snapshot_b64"]=base64.b64encode(snap_bytes).decode("ascii")
-                    r=sess.post(url, json=js, timeout=8)
+                    r=sess.post(url, json=js, timeout=15, allow_redirects=False)
                 else:
                     files={"snapshot": ("snapshot.jpg", snap_bytes, "image/jpeg")}
-                    r=sess.post(url, data=payload, files=files, timeout=8)
+                    r=sess.post(url, data=payload, files=files, timeout=15, allow_redirects=False)
             else:
-                if mode_lower == "json":
-                    r=sess.post(url, json=payload, timeout=8)
-                else:
-                    r=sess.post(url, data=payload, timeout=8)
-            return (200 <= r.status_code < 400), f"HTTP {r.status_code}"
+                r=sess.post(url, json=payload, timeout=15, allow_redirects=False)
+            ok = r.status_code in (200, 201, 202, 302)
+            print(f"[WH][cam{self.cam}] POST {url[:80]} → HTTP {r.status_code} {'OK' if ok else 'FAIL'}")
+            return ok, f"HTTP {r.status_code}"
         except Exception as e:
+            print(f"[WH][cam{self.cam}] ERROR POST {url[:80]} → {e}")
             return False, str(e)
 
     def _loop(self):
         sess=requests.Session()
         while True:
-            try:
-                item=self.q.get(timeout=2.0)
-            except queue.Empty:
-                thread_heartbeats[f"send_mgr_cam{self.cam}"] = time.time()
-                continue
-            thread_heartbeats[f"send_mgr_cam{self.cam}"] = time.time()
+            item=self.q.get()
             try:
                 endpoints=item["endpoints"]
                 payload=item["payload"]
@@ -1336,12 +1079,8 @@ class SendManager:
                     if not (url or "").strip():
                         continue
                     snap = (snap_jpeg if (send_snap and snap_jpeg is not None) else None)
-                    ok, err_msg = self._send_to_endpoint(sess, url, payload, snap, mode)
-                    if ok:
-                        print(f"[WEBHOOK][cam{self.cam}] Webhook enviado con éxito a {url} (Resp: {err_msg})")
-                        any_ok = True
-                    else:
-                        print(f"[WEBHOOK ERROR][cam{self.cam}] Error al enviar webhook a {url}: {err_msg}")
+                    ok,_=self._send_to_endpoint(sess, url, payload, snap, mode)
+                    any_ok = any_ok or ok
                 if any_ok:
                     self.sent += 1
             finally:
@@ -1390,24 +1129,28 @@ def _endpoints_pair(pair:dict):
 def enqueue_webhooks(cam:int, cat:str, pair:dict, usuario:str, dispositivo:str, valor:str, disp_vals:list[str], titles:list[str]):
     endpoints=_endpoints_pair(pair or {})
     if not any((u or "").strip() for (u,_,_) in endpoints):
+        print(f"[WH][cam{cam}][{cat}] Sin URLs configuradas — no se envía")
         return False, "Sin webhooks"
     with _send_lock[cam-1]:
         if not _should_send(cam, cat, valor):
+            print(f"[WH][cam{cam}][{cat}] Dedup/gap — ignorando '{valor}'")
             return False, "Dedup/gap"
         _mark_sent(cam, cat, valor)
     payload=_base_payload(cam, usuario, dispositivo, valor, disp_vals, titles)
+    urls=[u for u,_,_ in endpoints if (u or "").strip()]
+    print(f"[WH][cam{cam}][{cat}] Encolando '{valor}' → {urls}")
     send_mgr[cam-1].put({"payload": dict(payload), "endpoints": endpoints})
     return True, "Encolado"
 
 # ========== Motion + ROI ==========
 class MotionState:
     def __init__(self):
-        self.bg_subtractor=None
+        self.baseline=None
+        self.last_base_ts=0.0
         self.active=False
         self.last_motion_ts=0.0
         self.trigger=threading.Event()
         self.last_ratio=0.0
-        self.last_frame_ts=0.0
 
 motion=[MotionState(), MotionState()]
 
@@ -1440,57 +1183,66 @@ def _roi_gray_small(cam:int, frame):
             g=cv2.resize(g, (tw, th), interpolation=cv2.INTER_AREA)
     return g
 
+def _build_baseline(cam:int):
+    c=cfg["cameras"][cam-1]["motion"]
+    n=int(c.get("autobase_samples",3)); dt=float(c.get("autobase_interval_s",1.0))
+    samples=[]
+    for _ in range(max(1,n)):
+        fr=grab[cam-1].get()
+        if fr is not None:
+            g=_roi_gray_small(cam, fr)
+            if g is not None: samples.append(g)
+        time.sleep(dt)
+    if not samples: return None
+    min_h=min(s.shape[0] for s in samples); min_w=min(s.shape[1] for s in samples)
+    stack=np.stack([s[:min_h,:min_w] for s in samples], axis=0)
+    base=np.median(stack, axis=0).astype(np.uint8)
+    motion[cam-1].baseline=base; motion[cam-1].last_base_ts=time.time()
+    return base
+
 def _motion_ratio(cam:int, gray)->float:
-    st=motion[cam-1]
-    if st.bg_subtractor is None:
-        thr=int(cfg["cameras"][cam-1]["motion"].get("intensity_delta",25))
-        st.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=thr, detectShadows=False)
-    
-    fg_mask = st.bg_subtractor.apply(gray)
-    total = fg_mask.size
-    if total == 0: return 0.0
-    
-    changed = int(np.count_nonzero(fg_mask > 127))
-    return (100.0 * changed / float(total))
+    st=motion[cam-1]; base=st.baseline
+    if base is None: return 0.0
+    h=min(gray.shape[0], base.shape[0]); w=min(gray.shape[1], base.shape[1])
+    if h<8 or w<8: return 0.0
+    a=gray[:h,:w]; b=base[:h,:w]
+    d=cv2.absdiff(a,b)
+    thr=int(cfg["cameras"][cam-1]["motion"].get("intensity_delta",25))
+    _,bw=cv2.threshold(d, thr, 255, cv2.THRESH_BINARY)
+    changed=int(np.count_nonzero(bw)); total=bw.size
+    return (100.0*changed/float(total))
 
 def _motion_loop(cam:int):
     c=cfg["cameras"][cam-1]["motion"]
+    period_base=float(max(1, c.get("autobase_every_min",10)))*60.0
     cooldown=float(max(0.2, c.get("cooldown_s",2.0)))
     last_check=0.0
+    _build_baseline(cam)
     while True:
-        thread_heartbeats[f"motion_cam{cam}"] = time.time()
         try:
             if not cfg["cameras"][cam-1]["motion"].get("enabled",True):
                 motion[cam-1].active=True; time.sleep(0.2); continue
-            
-            fr, ts = grab[cam-1].get_with_ts()
-            if fr is None or ts == motion[cam-1].last_frame_ts:
-                time.sleep(0.02); continue
-            
-            motion[cam-1].last_frame_ts = ts
+            fr=grab[cam-1].get()
+            if fr is None: time.sleep(0.05); continue
             now=time.time()
-            
+            if (motion[cam-1].baseline is None) or ((now - motion[cam-1].last_base_ts) >= period_base):
+                _build_baseline(cam); time.sleep(0.1); continue
             if now - last_check < 0.05: time.sleep(0.02); continue
             last_check=now
-            
             g=_roi_gray_small(cam, fr)
             if g is None: time.sleep(0.02); continue
-            
             ratio=_motion_ratio(cam, g)
             motion[cam-1].last_ratio=ratio
             umbral=float(cfg["cameras"][cam-1]["motion"].get("pixel_change_pct",2.0))
             prev_active=motion[cam-1].active
-            
             if ratio >= umbral:
                 motion[cam-1].active=True; motion[cam-1].last_motion_ts=now
                 if not prev_active: motion[cam-1].trigger.set()
             else:
                 if (now - motion[cam-1].last_motion_ts) >= cooldown:
                     motion[cam-1].active=False
-            
             time.sleep(0.02)
-        except Exception as e:
-            print(f"[_motion_loop][cam{cam}] error: {e}")
+        except Exception:
             time.sleep(0.2)
 
 # ========== Auto-refresh WL ==========
@@ -1584,31 +1336,6 @@ def _iso_now():
     except Exception:
         return datetime.datetime.now().isoformat()
 
-def log_event(event_type, cam, identifier, confidence, category, user_type, auth, display_vals):
-    import csv
-    row = [
-        _iso_now(),
-        event_type,
-        f"CAM{cam}",
-        identifier,
-        f"{confidence:.2f}" if isinstance(confidence, float) else str(confidence),
-        category,
-        user_type,
-        "AUTORIZADO" if auth else "DENEGADO",
-        ";".join(display_vals)
-    ]
-    try:
-        exists = os.path.exists(LOG_FILE)
-        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if not exists:
-                writer.writerow(["Fecha/Hora", "Tipo", "Cámara", "Identificador", "Confianza", "Categoría", "Tipo Usuario", "Autorización", "Detalles"])
-            writer.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception as e:
-        print("[LOG ERROR] No se pudo escribir en el log local:", e)
-
 def _safe_hostname():
     try:
         return os.uname().nodename
@@ -1650,28 +1377,13 @@ def _heartbeat_payload():
         camd = OrderedDict()
         camd["cam"] = cam
 
-        # LAN (status real basado en URL materializada)
+        # LAN (solo si modo MAC)
         try:
-            url, mip, mmode = materialize_url(c)
             ip = None
             ok = False
-            # Si la URL tiene una IP explícita, probamos ping/tcp
-            if "{CAM_IP}" not in (url or ""):
-                if mip:
-                    ip = mip
-                else:
-                    # Extraer IP de la URL a la brava
-                    try: ip = url.split("@")[1].split(":")[0]
-                    except Exception: ip = None
-                
-                if ip:
-                    # check TCP 554
-                    try:
-                        with socket.create_connection((ip, 554), timeout=0.6):
-                            ok = True
-                    except Exception:
-                        ok = _ping(ip, 1)
-            
+            if (c.get("camera_mode","mac")=="mac") and (c.get("camera_mac","") or "").strip():
+                ip = resolve_ip_by_mac(c.get("camera_mac",""))
+                ok = bool(ip) and _ping(ip,1)
             camd["lan_ok"] = bool(ok)
             camd["lan_ip"] = (ip or "")
         except Exception:
@@ -1756,12 +1468,7 @@ class HeartbeatManager:
         sess = requests.Session()
         while True:
             try:
-                try:
-                    item = self.q.get(timeout=2.0)
-                except queue.Empty:
-                    thread_heartbeats["heartbeat_sender"] = time.time()
-                    continue
-                thread_heartbeats["heartbeat_sender"] = time.time()
+                item = self.q.get()
                 try:
                     hb_status["pending"] = int(self.q.qsize())
                     # Solo si está habilitado + URL + periodo >0 o si es "manual"
@@ -1830,38 +1537,31 @@ _last_auth_ts=[0.0,0.0]
 
 def _alpr_loop(cam:int):
     k=0
-    last_frame_ts=0.0
     while True:
-        thread_heartbeats[f"alpr_cam{cam}"] = time.time()
         try:
+            fr=grab[cam-1].get()
+            if fr is None:
+                time.sleep(0.02)
+                continue
+
             cdict=cfg["cameras"][cam-1]
             mot=motion[cam-1]
 
-            # 1. Verificar si hay movimiento antes de hacer cualquier cosa (evitamos consumir CPU)
-            if cdict["motion"].get("enabled", True) and not mot.active:
-                time.sleep(0.15)
+            if cdict["motion"].get("enabled",True) and not mot.active:
+                time.sleep(0.20)
                 if mot.trigger.is_set():
                     mot.trigger.clear()
                 else:
                     continue
 
-            # 2. Control de salteo de frames
-            # Si se acaba de activar el movimiento, procesamos el primer frame de inmediato (k=0)
             if mot.trigger.is_set():
                 mot.trigger.clear()
-                k = 0
-            else:
-                k = (k + 1) % cdict["process_every_n"]
-                if k != 0:
-                    time.sleep(0.01)
-                    continue
+                k=0
 
-            # 3. Obtener el frame más RECIENTE posible justo antes de la inferencia IA
-            fr, ts = grab[cam-1].get_with_ts()
-            if fr is None or ts == last_frame_ts:
+            k=(k+1)%cdict["process_every_n"]
+            if k!=0:
                 time.sleep(0.01)
                 continue
-            last_frame_ts = ts
 
             fr_roi=_apply_roi(cam, fr)
             fr_alpr=_preprocess_for_alpr(cam, fr_roi)
@@ -1876,109 +1576,93 @@ def _alpr_loop(cam:int):
             if not results:
                 _stable_state[cam-1]["last"]=""
                 _stable_state[cam-1]["hits"]=0
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             text, conf, det_conf = results[0]
 
-            if det_conf < float(cdict.get("det_min_confidence", 0.80)):
-                _stable_state[cam-1]["last"] = ""
-                _stable_state[cam-1]["hits"] = 0
-                time.sleep(0.05)
+            if det_conf < float(cdict.get("det_min_confidence",0.80)):
+                _stable_state[cam-1]["last"]=""
+                _stable_state[cam-1]["hits"]=0
+                time.sleep(0.01)
                 continue
 
-            min_conf = float(cdict.get("min_confidence", 0.85))
-            if conf < min_conf:
-                _stable_state[cam-1]["last"] = ""
-                _stable_state[cam-1]["hits"] = 0
-                time.sleep(0.05)
+            if conf < float(cdict.get("min_confidence",0.9)):
+                _stable_state[cam-1]["last"]=""
+                _stable_state[cam-1]["hits"]=0
+                time.sleep(0.01)
                 continue
 
             key = canon_plate(text)
-            
-            # --- CONSULTA PREVIA DE WHITELIST PARA RESPUESTA INMEDIATA (AGILIZACIÓN) ---
-            # Para placas que ya están en la lista y autorizadas, disparamos en el PRIMER hit
-            # Para placas no encontradas (NoFound), requerimos lecturas estables consecutivas para evitar spam
-            user_type, row = lookup_row(cam, text)
-            disp_vals = ["","",""]
-            titles = ["Folio","Nombre","Telefono"]
-            auth = False
-
-            if user_type == "PROPIETARIO":
-                sec = cdict["owners"]
-                auth = is_active_from_row(sec, row)
-                disp_vals = _extract_fields(row, sec.get("disp_cols"))
-                titles = sec.get("disp_titles", titles)
-                pair = sec["wh_active"] if auth else sec["wh_inactive"]
-                cat = "ACTIVE" if auth else "INACTIVE"
-            elif user_type == "VISITA":
-                sec = cdict["visitors"]
-                auth = is_active_from_row(sec, row)
-                disp_vals = _extract_fields(row, sec.get("disp_cols"))
-                titles = sec.get("disp_titles", titles)
-                pair = sec["wh_active"] if auth else sec["wh_inactive"]
-                cat = "ACTIVE" if auth else "INACTIVE"
-            else:
-                pair = cdict["wh_notfound"]
-                cat = "NOTFOUND"
-
-            # Determinar cantidad de hits requeridos
-            if auth:
-                needed = 1  # ¡Apertura inmediata e instantánea!
-            else:
-                if user_type == "NONE":
-                    needed = int(cdict.get("notfound_stable_hits_required", 3))
-                else:
-                    needed = int(cdict.get("stable_hits_required", 2))
-                # Si la confianza es extremadamente alta, permitimos 1 hit de confirmación
-                if conf >= 0.93 and det_conf >= 0.85:
-                    needed = 1
-
             if key == _stable_state[cam-1]["last"]:
                 _stable_state[cam-1]["hits"] += 1
             else:
                 _stable_state[cam-1]["last"] = key
                 _stable_state[cam-1]["hits"] = 1
 
+            needed = int(cdict.get("stable_hits_required",2))
             if _stable_state[cam-1]["hits"] < needed:
                 time.sleep(0.01)
                 continue
 
-            # Suprimir NoFound repetidos por unos segundos después de una lectura válida
+            user_type, row = lookup_row(cam, text)
+            disp_vals=["","",""]
+            titles=["Folio","Nombre","Telefono"]
+            auth=False
+
+            needed = int(cdict.get("stable_hits_required",2))
             if user_type == "NONE":
-                sup = int(cdict.get("suppress_notfound_after_auth_sec", 8))
+                needed = int(cdict.get("notfound_stable_hits_required",4))
+
+            if _stable_state[cam-1]["hits"] < needed:
+                time.sleep(0.01)
+                continue
+
+            # suprimir NoFound por unos segundos después de lectura válida
+            if user_type == "NONE":
+                sup = int(cdict.get("suppress_notfound_after_auth_sec",8))
                 if sup > 0 and (time.time() - _last_auth_ts[cam-1]) < sup:
                     time.sleep(0.01)
                     continue
 
-            # Registrar tiempo de última autorización exitosa para supresión
-            if auth:
+            if user_type=="PROPIETARIO":
                 _last_auth_ts[cam-1] = time.time()
+                sec=cdict["owners"]
+                auth=is_active_from_row(sec,row)
+                disp_vals=_extract_fields(row, sec.get("disp_cols"))
+                titles=sec.get("disp_titles",titles)
+                pair=sec["wh_active"] if auth else sec["wh_inactive"]
+                cat="ACTIVE" if auth else "INACTIVE"
+            elif user_type=="VISITA":
+                _last_auth_ts[cam-1] = time.time()
+                sec=cdict["visitors"]
+                auth=is_active_from_row(sec,row)
+                disp_vals=_extract_fields(row, sec.get("disp_cols"))
+                titles=sec.get("disp_titles",titles)
+                pair=sec["wh_active"] if auth else sec["wh_inactive"]
+                cat="ACTIVE" if auth else "INACTIVE"
+            else:
+                pair=cdict["wh_notfound"]
+                cat="NOTFOUND"
 
-            # Disparar apertura de la barrera física de inmediato
-            if auth and cdict.get("gate_enabled", False) and cdict.get("gate_auto_on_auth", False):
+            if auth and cdict.get("gate_enabled",False) and cdict.get("gate_auto_on_auth",False):
                 if gate_can_fire(cam):
                     gate_fire(cam)
 
-            # Enviar Webhooks correspondientes
-            if user_type != "NONE":
+            if user_type!="NONE":
                 enqueue_webhooks(cam, cat, pair, user_type, "Placa", text, disp_vals, titles)
             else:
                 enqueue_webhooks(cam, "NOTFOUND", pair, "NoFound", "Placa", text, ["","",""], ["Folio","Nombre","Telefono"])
 
-            # Actualizar estado de la interfaz web
             with slock[cam-1]:
-                states[cam-1]["plate"] = text
-                states[cam-1]["conf"] = float(conf)
-                states[cam-1]["ts"] = time.time()
-                states[cam-1]["auth"] = bool(auth)
-                states[cam-1]["cat"] = cat
-                states[cam-1]["display"] = disp_vals
-                states[cam-1]["titles"] = titles
-                states[cam-1]["user_type"] = user_type
-
-            # Registrar en el log local permanente (inmune a fallas)
-            log_event("PLACA", cam, text, float(conf), cat, user_type, auth, disp_vals)
+                states[cam-1]["plate"]=text
+                states[cam-1]["conf"]=float(conf)
+                states[cam-1]["ts"]=time.time()
+                states[cam-1]["auth"]=bool(auth)
+                states[cam-1]["cat"]=cat
+                states[cam-1]["display"]=disp_vals
+                states[cam-1]["titles"]=titles
+                states[cam-1]["user_type"]=user_type
 
             time.sleep(0.005)
 
@@ -1997,24 +1681,21 @@ def _check_token():
 
 # ========== UI ==========
 HOME = """
- <style>
- body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#f8fafc;color:#1e293b}
- h1{margin:0 0 12px;font-weight:800;letter-spacing:-0.5px;color:#0f172a;font-size:26px}
- .net{font-size:13px;color:#64748b;margin-bottom:20px;background:#fff;padding:10px 16px;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,0.05);display:inline-block;border:1px solid #e2e8f0}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px}
- .card{border:1px solid #e2e8f0;border-radius:16px;padding:24px;background:#fff;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03)}
- .card h3{margin:0 0 16px 0;font-size:18px;color:#0f172a;border-bottom:1px solid #f1f5f9;padding-bottom:12px}
- .plate{font-family:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:46px;font-weight:800;border:3px solid #0f172a;border-radius:12px;padding:8px 16px;background:#fff;display:inline-block;min-width:240px;text-align:center;box-shadow:inset 0 2px 4px rgba(0,0,0,0.05), 0 4px 6px rgba(0,0,0,0.05);letter-spacing:2px;color:#0f172a;margin-bottom:6px}
- .tag{font-family:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:24px;font-weight:700;border:2px dashed #cbd5e1;border-radius:12px;padding:8px 16px;background:#f8fafc;display:inline-block;min-width:240px;text-align:center;color:#64748b;margin-bottom:6px}
- .muted{color:#64748b;font-size:12px} .hit{color:#10b981;font-weight:700} .miss{color:#ef4444;font-weight:700}
- .ok{color:#10b981;font-weight:600} .bad{color:#ef4444;font-weight:600} 
- .btn{padding:8px 14px;border:none;border-radius:8px;background:#f1f5f9;cursor:pointer;font-weight:600;font-size:13px;color:#334155;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
- .btn:hover{background:#e2e8f0;transform:translateY(-1px)}
- .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 6px;vertical-align:middle;box-shadow:0 0 0 2px #fff}
- .on{background:#10b981;box-shadow:0 0 0 2px #fff, 0 0 8px #10b981}.off{background:#cbd5e1}
- .row{display:flex;gap:16px;flex-wrap:wrap;align-items:center}
- .k{font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:0.5px;color:#94a3b8;margin-bottom:6px}
- </style>
+<style>
+ body{font-family:system-ui;margin:16px;background:#fafafa}
+ h1{margin:0 0 8px}
+ .net{font-size:13px;color:#444;margin-bottom:10px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+ .card{border:1px solid #ddd;border-radius:14px;padding:12px;background:#fff}
+ .plate{font-size:36px;font-weight:800;border:2px solid #111;border-radius:12px;padding:4px 10px;background:#fff;display:inline-block;min-width:220px;text-align:center}
+ .tag{font-size:24px;font-weight:700;border:2px dashed #333;border-radius:12px;padding:4px 10px;background:#f7f7f7;display:inline-block;min-width:220px;text-align:center}
+ .muted{color:#666;font-size:12px} .hit{color:#0a0;font-weight:700} .miss{color:#a00;font-weight:700}
+ .ok{color:#2e7d32} .bad{color:#c62828} .btn{padding:7px 11px;border:1px solid #888;border-radius:10px;background:#f5f5f5;cursor:pointer}
+ .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 6px;vertical-align:middle}
+ .on{background:#28a745}.off{background:#999}
+ .row{display:flex;gap:10px;flex-wrap:wrap}
+ .k{font-weight:600}
+</style>
 <h1>{{title}}</h1>
 <div class="net">
   Wi-Fi: <b id="net_ssid">—</b> • Señal: <b id="net_sig">—</b>% • IP: <b id="net_ip">—</b>
@@ -2031,8 +1712,6 @@ HOME = """
       • Cola: <b id="q{{cam}}">—</b></div>
     {% endfor %}
     <div style="flex:1"></div>
-    <a class="btn" href="/wifi" style="margin-right:8px;background:#17a2b8;color:#fff;text-decoration:none">📡 WiFi</a>
-    <a class="btn" href="/logs" style="margin-right:8px;background:#28a745;color:#fff;text-decoration:none">📝 Logs</a>
     <a class="btn" href="/settings">⚙️ Settings</a>
   </div>
 </div>
@@ -2150,7 +1829,7 @@ async function openGate(cam){
   }catch(e){m.textContent='Error: '+e;} finally{setTimeout(()=>m.textContent='',1500);}
 }
 
-setInterval(poll,500);
+setInterval(poll,2500);
 poll();
 </script>
 """
@@ -2200,32 +1879,24 @@ ROI_HTML = """<!doctype html><meta charset="utf-8"><title>ROI Cam {{cam}}</title
 
 <script>
 const cam={{cam}};
-const imgEl=document.getElementById('raw');
+const img=document.getElementById('raw');
 const cnv=document.getElementById('cnv');
 const ctx=cnv.getContext('2d');
 const proc=document.getElementById('proc');
-
-// Dimensiones FIJAS del canvas (se establecen al cargar la primera imagen y NO cambian).
-// Esto evita que el ROI "se mueva" cuando refrescamos el snapshot.
-let canvasW=0, canvasH=0;
 
 let roi={x:0,y:0,w:1,h:1,enabled:false};
 let dragging=false, sx=0, sy=0, ex=0, ey=0;
 
 function draw(){
-  if(!canvasW || !canvasH) return;
-  ctx.clearRect(0,0,canvasW,canvasH);
-  if(imgEl.complete && imgEl.naturalWidth>0){
-    ctx.drawImage(imgEl, 0, 0, canvasW, canvasH);
-  }
-  // ROI guardado (verde)
-  if(roi.w>0.01 && roi.h>0.01){
+  if(!img.naturalWidth){return;}
+  cnv.width = img.naturalWidth; cnv.height = img.naturalHeight;
+  ctx.drawImage(img,0,0);
+  if(roi.w>0 && roi.h>0){
     ctx.lineWidth=2; ctx.strokeStyle='rgba(0,200,0,0.9)';
     ctx.setLineDash([6,4]);
-    ctx.strokeRect(roi.x*canvasW, roi.y*canvasH, roi.w*canvasW, roi.h*canvasH);
+    ctx.strokeRect(roi.x*cnv.width, roi.y*cnv.height, roi.w*cnv.width, roi.h*cnv.height);
     ctx.setLineDash([]);
   }
-  // Rectángulo arrastrando (naranja)
   if(dragging){
     const x=Math.min(sx,ex), y=Math.min(sy,ey);
     const w=Math.abs(ex-sx), h=Math.abs(ey-sy);
@@ -2234,16 +1905,15 @@ function draw(){
   }
 }
 
-// Convierte coordenadas CSS (del evento mouse/touch) a coordenadas internas del canvas.
-// Usa las dimensiones CSS actuales del canvas (que cambian con el viewport) y las
-// escala a las dimensiones internas fijas (canvasW x canvasH).
 function _toCanvasXY(e){
   const r = cnv.getBoundingClientRect();
+  // Coordenadas en CSS pixels
   const cx = (e.clientX - r.left);
   const cy = (e.clientY - r.top);
-  const scaleX = canvasW / Math.max(1, r.width);
-  const scaleY = canvasH / Math.max(1, r.height);
-  return {x: cx*scaleX, y: cy*scaleY};
+  // Escala CSS->canvas real
+  const sx = (cnv.width  / Math.max(1, r.width));
+  const sy = (cnv.height / Math.max(1, r.height));
+  return {x: cx*sx, y: cy*sy};
 }
 
 function _startDrag(e){
@@ -2261,10 +1931,10 @@ function _endDrag(e){
   if(!dragging) return;
   e.preventDefault();
   dragging=false;
-  const x=Math.max(0, Math.min(sx,ex)) / canvasW;
-  const y=Math.max(0, Math.min(sy,ey)) / canvasH;
-  const w=Math.abs(ex-sx) / canvasW;
-  const h=Math.abs(ey-sy) / canvasH;
+  const x=Math.max(0,Math.min(sx,ex))/cnv.width;
+  const y=Math.max(0,Math.min(sy,ey))/cnv.height;
+  const w=Math.abs(ex-sx)/cnv.width;
+  const h=Math.abs(ey-sy)/cnv.height;
   if(w>0.01 && h>0.01){ roi.x=x; roi.y=y; roi.w=w; roi.h=h; }
   draw();
 }
@@ -2274,7 +1944,7 @@ cnv.addEventListener('mousedown', _startDrag);
 cnv.addEventListener('mousemove', _moveDrag);
 window.addEventListener('mouseup', _endDrag);
 
-// Touch
+// Touch (por si usas tablet)
 cnv.addEventListener('touchstart', (ev)=>{ if(ev.touches && ev.touches[0]) _startDrag(ev.touches[0]); }, {passive:false});
 cnv.addEventListener('touchmove',  (ev)=>{ if(ev.touches && ev.touches[0]) _moveDrag(ev.touches[0]);  }, {passive:false});
 window.addEventListener('touchend', (ev)=>{ _endDrag(ev.changedTouches && ev.changedTouches[0] ? ev.changedTouches[0] : ev); }, {passive:false});
@@ -2306,32 +1976,15 @@ document.getElementById('clearBtn').onclick=async ()=>{
   refreshProcessed();
 };
 
-async function refreshSnapshot(){
-  const tmp = new Image();
-  tmp.crossOrigin='anonymous';
-  tmp.onload = ()=>{
-    // Primera vez: fijar dimensiones del canvas a las de la imagen real
-    if(!canvasW || !canvasH){
-      canvasW = tmp.naturalWidth;
-      canvasH = tmp.naturalHeight;
-      cnv.width  = canvasW;
-      cnv.height = canvasH;
-    }
-    // Actualizar el src del img original para que draw() lo use
-    imgEl.src = tmp.src;
-    draw();
-  };
-  tmp.onerror = ()=>{ setTimeout(refreshSnapshot, 800); };
-  tmp.src = '/snapshot.jpg?cam='+cam+'&w=1280&q=90&ts='+(Date.now());
-}
+async function refreshSnapshot(){ img.src='/snapshot.jpg?cam='+cam+'&w=960&ts='+(Date.now()); }
+async function refreshProcessed(){ proc.src='/snapshot_alpr.jpg?cam='+cam+'&w=960&ts='+(Date.now()); }
 
-async function refreshProcessed(){
-  proc.src='/snapshot_alpr.jpg?cam='+cam+'&w=1280&q=90&ts='+(Date.now());
-}
+img.onload=()=>{ draw(); };
+img.onerror=()=>{ setTimeout(refreshSnapshot, 800); };
 
 window.onload=async ()=>{
   await loadCur();
-  await refreshSnapshot();
+  refreshSnapshot();
   refreshProcessed();
   setInterval(refreshSnapshot, 4000);
   setInterval(refreshProcessed, 1200);
@@ -2492,21 +2145,44 @@ SETTINGS_CAM = """
     <div class="muted">Define ROI en <a class="a" href="/roi?cam={{cam}}" target="_blank">/roi?cam={{cam}}</a></div>
   </div>
 
-  <div class="subsec hl" style="margin-top: 15px;">
-    <b>⚙️ Rendimiento y Optimización de IA (Autopreparado)</b>
-    <div class="muted" style="margin-top: 5px; line-height: 1.4;">
-      El portal ha sido configurado en su <b>configuración base óptima</b> para Raspberry Pi 5. Los parámetros de red neuronal, tamaño de red (800px), confianza mínima (85%), filtrado bilateral lento (desactivado) y tasa de frames han sido bloqueados en el sistema para garantizar el funcionamiento más veloz y estable del procesador.
-    </div>
+  <h3>Procesamiento ALPR</h3>
+  <div class="grid4">
+    <label>Procesar cada N frames<br><input type="number" step="1" name="process_every_n" value="{{c.process_every_n}}"></label>
+    <label>Max ancho (px)<br><input type="number" step="10" name="resize_max_w" value="{{c.resize_max_w}}"></label>
+    <label>Top-K<br><input type="number" step="1" name="alpr_topk" value="{{c.alpr_topk}}"></label>
+    <label>Umbral conf (%)<br><input type="number" step="1" name="min_conf_pct" value="{{(c.min_confidence*100)|round(0,'floor')}}"></label>
+    <label>Idle clear (s)<br><input type="number" step="0.1" name="idle_clear_sec" value="{{c.idle_clear_sec}}"></label>
   </div>
 
-  <h3>Motion gating (Detección de Movimiento)</h3>
-  <div class="grid">
-    <label><input type="checkbox" name="motion_enabled" {{'checked' if c.motion.enabled else ''}}> Habilitar Detección de Movimiento en ROI</label>
-    <label>Umbral cambio pix (%)<br>
-      <input type="number" step="0.1" name="motion_pixel_change_pct" value="{{c.motion.pixel_change_pct}}">
+  
+  <h3>Pre-procesado (solo ALPR, NO afecta Snapshot/Stream)</h3>
+  <div class="grid4">
+    <label><input type="checkbox" name="pp_enabled" {{'checked' if c.pp_enabled else ''}}> Habilitar</label>
+    <label>Perfil<br>
+      <select name="pp_profile">
+        <option value="none" {{'selected' if c.pp_profile=='none' else ''}}>none (sin cambios)</option>
+        <option value="bw_hicontrast_sharp" {{'selected' if c.pp_profile=='bw_hicontrast_sharp' else ''}}>B/N alto contraste + nitidez</option>
+      </select>
+    </label>
+    <label>CLAHE clipLimit (1.0-4.0)<br>
+      <input type="number" step="0.1" name="pp_clahe_clip" value="{{c.pp_clahe_clip}}">
+    </label>
+    <label>Nitidez (0.0-1.2)<br>
+      <input type="number" step="0.05" name="pp_sharp_strength" value="{{c.pp_sharp_strength}}">
     </label>
   </div>
-  <div class="muted">Si se habilita, la Inteligencia Artificial solo procesará imágenes cuando se detecte movimiento dentro de la zona de interés (ROI). El umbral define qué porcentaje de píxeles debe cambiar para activarse (típico: 2.0% a 8.0%).</div>
+  <div class="muted">Solo afecta el frame que entra a ALPR (respeta process_every_n). Snapshots/stream quedan intactos.</div>
+
+<h3>Motion gating (en ROI)</h3>
+  <div class="grid4">
+    <label><input type="checkbox" name="motion_enabled" {{'checked' if c.motion.enabled else ''}}> Habilitar</label>
+    <label>Umbral cambio pix (%)<br><input type="number" step="0.1" name="motion_pixel_change_pct" value="{{c.motion.pixel_change_pct}}"></label>
+    <label>Δ intensidad (0-255)<br><input type="number" step="1" name="motion_intensity_delta" value="{{c.motion.intensity_delta}}"></label>
+    <label>Recalibrar (min)<br><input type="number" step="1" name="motion_autobase_every_min" value="{{c.motion.autobase_every_min}}"></label>
+    <label>Muestras baseline<br><input type="number" step="1" name="motion_autobase_samples" value="{{c.motion.autobase_samples}}"></label>
+    <label>Intervalo muestras (s)<br><input type="number" step="0.1" name="motion_autobase_interval_s" value="{{c.motion.autobase_interval_s}}"></label>
+    <label>Cooldown (s)<br><input type="number" step="0.1" name="motion_cooldown_s" value="{{c.motion.cooldown_s}}"></label>
+  </div>
 
   <h3>Gate / ESP32</h3>
   <div class="grid">
@@ -2798,32 +2474,38 @@ def settings_cam(cam:int):
         c["camera_url"]=request.form.get("camera_url", c.get("camera_url",""))
         c["roi"]["enabled"]=bool(request.form.get("roi_enabled"))
 
-        # ALPR (Valores optimizados forzados)
-        c["process_every_n"] = 4       # Procesar cada 4 frames (7.5 FPS a 30 FPS de la cámara)
-        c["resize_max_w"] = 800        # Resolución de red óptima
-        c["alpr_topk"] = 1             # Solo necesitamos 1 candidato
-        c["min_confidence"] = 0.85     # Umbral del 85% de confianza mínima
-        c["idle_clear_sec"] = 2.0      # Borrar del display a los 2 segundos de inactividad
-
-        # Pre-procesado (Forzar apagado para no saturar la CPU)
-        c["pp_enabled"] = False
-        c["pp_profile"] = "none"
-        c["pp_clahe_clip"] = 2.0
-        c["pp_sharp_strength"] = 0.55
-
-        # Motion (Valores optimizados para evitar falsos positivos y spam)
-        m = c["motion"]
-        m["enabled"] = bool(request.form.get("motion_enabled"))
+        # ALPR
+        c["process_every_n"]=_clampi(request.form.get("process_every_n", c.get("process_every_n",2)),1,30,c.get("process_every_n",2))
+        c["resize_max_w"]=_clampi(request.form.get("resize_max_w", c.get("resize_max_w",1280)),64,4096,c.get("resize_max_w",1280))
+        c["alpr_topk"]=_clampi(request.form.get("alpr_topk", c.get("alpr_topk",3)),1,5,c.get("alpr_topk",3))
         try:
-            m["pixel_change_pct"] = float(request.form.get("motion_pixel_change_pct", m.get("pixel_change_pct", 5.0)))
-        except:
-            m["pixel_change_pct"] = 5.0
-        if m["enabled"]:
-            m["intensity_delta"] = 25
-            m["autobase_every_min"] = 10
-            m["autobase_samples"] = 3
-            m["autobase_interval_s"] = 1.0
-            m["cooldown_s"] = 2.0
+            pct=float(request.form.get("min_conf_pct", c.get("min_confidence",0.9)*100.0))/100.0
+            c["min_confidence"]=_clampf(pct,0,1,c.get("min_confidence",0.9))
+        except: pass
+        try:
+            c["idle_clear_sec"]=max(0.5, float(request.form.get("idle_clear_sec", c.get("idle_clear_sec",1.5))))
+        except: pass
+
+        # Pre-procesado (solo ALPR)
+        c["pp_enabled"]=bool(request.form.get("pp_enabled"))
+        c["pp_profile"]=(request.form.get("pp_profile", c.get("pp_profile","none")) or "none").strip().lower()
+        if c["pp_profile"] not in ("none","bw_hicontrast_sharp"):
+            c["pp_profile"]="none"
+        c["pp_clahe_clip"]=_clampf(request.form.get("pp_clahe_clip", c.get("pp_clahe_clip",2.0)), 1.0, 4.0, c.get("pp_clahe_clip",2.0))
+        c["pp_sharp_strength"]=_clampf(request.form.get("pp_sharp_strength", c.get("pp_sharp_strength",0.55)), 0.0, 1.2, c.get("pp_sharp_strength",0.55))
+
+        # Motion
+        m=c["motion"]
+        m["enabled"]=bool(request.form.get("motion_enabled"))
+        try: m["pixel_change_pct"]=float(request.form.get("motion_pixel_change_pct", m.get("pixel_change_pct",2.0)))
+        except: pass
+        m["intensity_delta"]=_clampi(request.form.get("motion_intensity_delta", m.get("intensity_delta",25)), 1, 255, m.get("intensity_delta",25))
+        m["autobase_every_min"]=_clampi(request.form.get("motion_autobase_every_min", m.get("autobase_every_min",10)),1,1440,m.get("autobase_every_min",10))
+        m["autobase_samples"]=_clampi(request.form.get("motion_autobase_samples", m.get("autobase_samples",3)),1,5,m.get("autobase_samples",3))
+        try: m["autobase_interval_s"]=max(0.2, float(request.form.get("motion_autobase_interval_s", m.get("autobase_interval_s",1.0))))
+        except: pass
+        try: m["cooldown_s"]=max(0.2, float(request.form.get("motion_cooldown_s", m.get("cooldown_s",2.0))))
+        except: pass
 
         # Gate
         c["gate_enabled"]=bool(request.form.get("gate_enabled"))
@@ -3000,18 +2682,26 @@ def api_lan():
     out={}
     for cam in (1,2):
         c=cfg["cameras"][cam-1]
-        url, mip, mmode = materialize_url(c)
-        
-        if "{CAM_IP}" in (url or ""):
-            # Sigue sin resolver MAC
-            out[f"cam{cam}"]={"ok":False,"ip":"","host":"","mode":mmode,"port":554,"tcp":False}
+        mode=(c.get("camera_mode","mac") or "mac").lower()
+
+        if mode=="mac":
+            mac=(c.get("camera_mac","") or "").strip()
+            if not mac:
+                out[f"cam{cam}"]={"ok":False,"ip":"","host":"","mode":"mac","port":554,"tcp":False}
+                continue
+            ip=resolve_ip_by_mac(mac)
+            tcp=_tcp_ok(ip, 554, timeout=0.6) if ip else False
+            ok = tcp or (bool(ip) and _ping(ip,1))
+            out[f"cam{cam}"]={"ok":ok,"ip":(ip or ""),"host":"","mode":"mac","port":554,"tcp":tcp}
             continue
-            
+
+        # manual
+        url=(c.get("camera_url","") or "").strip()
         host, port = _extract_host_port(url)
         ip=_resolve_host(host) if host else ""
         tcp=_tcp_ok(ip, port, timeout=0.6) if ip else False
         ok = tcp or (bool(ip) and _ping(ip,1))
-        out[f"cam{cam}"]={"ok":ok,"ip":(ip or ""),"host":(host or ""),"mode":mmode,"port":int(port or 554),"tcp":tcp}
+        out[f"cam{cam}"]={"ok":ok,"ip":(ip or ""),"host":(host or ""),"mode":"manual","port":int(port or 554),"tcp":tcp}
 
     return jsonify(out)
 
@@ -3045,7 +2735,7 @@ def snapshot():
     if w>32:
         h,wi=fr2.shape[:2]; tw=min(w,wi); th=int(h*(tw/float(wi)))
         fr2=cv2.resize(fr2,(tw,th),interpolation=cv2.INTER_AREA)
-    ok,buf=cv2.imencode(".jpg", fr2, [cv2.IMWRITE_JPEG_QUALITY,92])
+    ok,buf=cv2.imencode(".jpg", fr2, [cv2.IMWRITE_JPEG_QUALITY,75])
     if not ok: return ("Encode error",500,{"Content-Type":"text/plain"})
     r=Response(buf.tobytes(), mimetype="image/jpeg")
     r.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0, no-transform"
@@ -3298,8 +2988,6 @@ def api_tag_event():
         tag_states[cam-1]["user_type"]=user_type
         tag_states[cam-1]["fields"]=disp_vals
 
-    log_event("TAG", cam, pkey, 1.00, cat, user_type, auth, disp_vals)
-
     # Webhooks tags
     if user_type=="PROPIETARIO":
         enqueue_webhooks(cam, cat, pair, user_type, "Tag", pkey, disp_vals, titles)
@@ -3368,452 +3056,18 @@ def healthz():
     ok2=grab[1].get() is not None
     return (f"CAM1:{'OK' if ok1 else 'NO'} CAM2:{'OK' if ok2 else 'NO'}", (200 if (ok1 or ok2) else 503))
 
-# ========== WiFi Manager ==========
-WIFI_HTML = """<!doctype html><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WiFi Manager</title>
-<style>
- body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;padding:20px;background:#f5f6fa;color:#333}
- .card{background:#fff;border-radius:12px;padding:20px;max-width:600px;margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
- h2{margin-top:0;font-weight:600;color:#111}
- p{line-height:1.5;color:#555}
- .row{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eee;align-items:center;flex-wrap:wrap;gap:10px}
- .row:last-child{border-bottom:none}
- .btn{padding:10px 18px;background:#007bff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;transition:0.2s}
- .btn:hover{background:#0056b3}
- .btn:disabled{background:#ccc;cursor:not-allowed}
- input[type="password"]{padding:10px;border:1px solid #ccc;border-radius:6px;width:150px;font-size:14px}
- .msg{margin-top:15px;color:#d9534f;font-weight:bold;padding:10px;border-radius:6px;background:#fdf2f2;display:none}
- .msg.active{display:block}
- .msg.ok{color:#155724;background:#d4edda}
- .controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
- .controls a.btn{background:#6c757d;text-decoration:none;display:inline-block}
- .controls a.btn:hover{background:#5a6268}
-</style>
-<div class="card">
-  <h2>📡 Gestor de Redes WiFi</h2>
-  <p>Escanea y conecta la Raspberry Pi a redes inalámbricas. Las redes guardadas se recordarán automáticamente en el futuro, ideal para configurarla en el laboratorio antes de instalar en campo.</p>
-  
-  <div class="controls">
-    <button class="btn" id="scanBtn" onclick="scan()">🔄 Escanear Redes</button>
-    <a class="btn" href="/">⬅ Volver al Portal</a>
-  </div>
-  
-  <div id="status" class="msg"></div>
-  <div id="list" style="margin-top:20px"></div>
-  
-  <div style="margin-top:30px;padding-top:20px;border-top:1px solid #eee">
-    <h3 style="margin-top:0">Agregar Red Manualmente</h3>
-    <p style="font-size:14px;color:#666">Usa esta opción para configurar una red oculta o una red que no aparece en el escaneo (ej. la red del cliente final donde se instalará el equipo).</p>
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <input type="text" id="manual_ssid" placeholder="Nombre de la red (SSID)" style="padding:10px;border:1px solid #ccc;border-radius:6px;flex:1;min-width:150px">
-      <input type="password" id="manual_pw" placeholder="Contraseña (opcional)" style="padding:10px;border:1px solid #ccc;border-radius:6px;flex:1;min-width:150px">
-      <button class="btn" onclick="connectManual()">Guardar y Conectar</button>
-    </div>
-  </div>
-</div>
-
-<script>
-function showMsg(txt, isOk=false) {
-  const el = document.getElementById('status');
-  el.textContent = txt;
-  el.className = 'msg active ' + (isOk ? 'ok' : '');
-}
-
-async function scan(){
-  const btn = document.getElementById('scanBtn');
-  const lst = document.getElementById('list');
-  btn.disabled = true;
-  showMsg("Escaneando redes (puede tardar unos segundos)...");
-  lst.innerHTML = "";
-  
-  try {
-    const r = await fetch('/api/wifi/scan');
-    const data = await r.json();
-    if(!data.ok) throw new Error(data.error);
-    
-    if(data.networks.length === 0){
-      showMsg("No se encontraron redes WiFi cercanas.", false);
-    } else {
-      document.getElementById('status').className = "msg"; // Hide msg
-      data.networks.forEach(nw => {
-        if(!nw.ssid) return;
-        const row = document.createElement('div');
-        row.className = "row";
-        row.innerHTML = `
-          <div style="flex:1;min-width:200px">
-            <strong style="font-size:16px;color:#000">${nw.ssid}</strong><br>
-            <small style="color:#666">📶 Señal: ${nw.signal}% &nbsp;•&nbsp; 🔒 Seg: ${nw.security}</small>
-          </div>
-          <div style="display:flex;gap:8px">
-            <input type="password" id="pw_${btoa(nw.ssid).replace(/=/g,'')}" placeholder="Contraseña">
-            <button class="btn" onclick="connect('${nw.ssid}', '${btoa(nw.ssid).replace(/=/g,'')}')">Conectar</button>
-          </div>
-        `;
-        lst.appendChild(row);
-      });
-    }
-  } catch(e) {
-    showMsg("Error: " + e.message, false);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function connect(ssid, id){
-  const pwEl = document.getElementById('pw_'+id);
-  const pw = pwEl.value;
-  showMsg("Conectando a '" + ssid + "'... Esto puede demorar.", false);
-  
-  try {
-    const r = await fetch('/api/wifi/connect', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ssid: ssid, password: pw})
-    });
-    const data = await r.json();
-    if(data.ok){
-      showMsg("¡Conectado exitosamente a " + ssid + "!", true);
-      pwEl.value = '';
-    } else {
-      showMsg("Error al conectar: " + (data.error || "Revisa la contraseña"), false);
-    }
-  } catch(e) {
-    showMsg("Error de red: " + e.message, false);
-  }
-}
-
-async function connectManual(){
-  const ssid = document.getElementById('manual_ssid').value.trim();
-  if(!ssid){
-    showMsg("Ingresa el nombre de la red (SSID)", false);
-    return;
-  }
-  const pw = document.getElementById('manual_pw').value;
-  showMsg("Guardando perfil para '" + ssid + "'...", false);
-  
-  try {
-    const r = await fetch('/api/wifi/connect', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ssid: ssid, password: pw})
-    });
-    const data = await r.json();
-    if(data.ok){
-      showMsg("¡Red " + ssid + " guardada exitosamente!", true);
-      document.getElementById('manual_ssid').value = '';
-      document.getElementById('manual_pw').value = '';
-    } else {
-      showMsg("Atención: " + (data.error || "Fallo al configurar"), false);
-      // Even if nmcli fails (e.g. out of range), the profile MIGHT have been created, 
-      // but nmcli connect fails when out of range. That's fine for our use case.
-    }
-  } catch(e) {
-    showMsg("Error de red: " + e.message, false);
-  }
-}
-</script>
-"""
-
-@app.route("/wifi")
-def wifi_page():
-    return render_template_string(WIFI_HTML)
-
-@app.route("/api/wifi/scan")
-def api_wifi_scan():
-    code, out = sh("nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list")
-    if code != 0:
-        return jsonify({"ok":False, "error": out})
-    seen = set()
-    nets = []
-    for line in out.splitlines():
-        parts = line.split(":")
-        if len(parts) >= 3:
-            ssid = parts[0].strip()
-            # ignorar redes ocultas o ya vistas
-            if not ssid or ssid in seen or ssid.startswith("--"): 
-                continue
-            seen.add(ssid)
-            nets.append({
-                "ssid": ssid,
-                "signal": parts[1].strip(),
-                "security": parts[2].strip()
-            })
-    return jsonify({"ok":True, "networks": nets})
-
-@app.route("/api/wifi/connect", methods=["POST"])
-def api_wifi_connect():
-    data = request.get_json() or {}
-    ssid = data.get("ssid", "").replace("'", "")
-    pw = data.get("password", "").replace("'", "")
-    if not ssid:
-        return jsonify({"ok":False, "error":"SSID vacío"})
-    
-    # Intenta borrar conexión previa para evitar conflictos si cambió la clave
-    sh(f"nmcli connection delete '{ssid}'")
-    
-    if pw:
-        cmd = f"nmcli dev wifi connect '{ssid}' password '{pw}'"
-    else:
-        cmd = f"nmcli dev wifi connect '{ssid}'"
-        
-    code, out = sh(cmd)
-    return jsonify({"ok":(code==0), "error":out if code!=0 else ""})
-
-# ========== Logs & Diagnóstico ==========
-@app.route("/logs")
-def view_logs():
-    import csv
-    logs = []
-    headers = ["Fecha/Hora", "Tipo", "Cámara", "Identificador", "Confianza", "Categoría", "Tipo Usuario", "Autorización", "Detalles"]
-    try:
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                rows = list(reader)
-                if len(rows) > 1:
-                    headers = rows[0]
-                    logs = rows[1:][-300:]
-                    logs.reverse()
-    except Exception as e:
-        print("Error leyendo logs:", e)
-
-    now = time.time()
-    thread_status = []
-    for name, ts in sorted(thread_heartbeats.items()):
-        diff = now - ts
-        status = "ACTIVO" if diff < 45 else "INACTIVO/CONGELADO"
-        color = "#10b981" if diff < 45 else "#ef4444"
-        thread_status.append({
-            "name": name,
-            "last_seen": f"{diff:.1f}s atrás",
-            "status": status,
-            "color": color
-        })
-
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>Historial de Eventos - Comunito Portal</title>
-      <style>
-        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#f8fafc;color:#1e293b}
-        h1{margin:0 0 12px;font-weight:800;letter-spacing:-0.5px;color:#0f172a;font-size:26px}
-        .btn{padding:8px 14px;border:none;border-radius:8px;background:#cbd5e1;cursor:pointer;font-weight:600;font-size:13px;color:#334155;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;margin-right:8px}
-        .btn:hover{background:#94a3b8;transform:translateY(-1px)}
-        .btn-primary{background:#2563eb;color:#fff}
-        .btn-primary:hover{background:#1d4ed8}
-        .btn-danger{background:#ef4444;color:#fff}
-        .btn-danger:hover{background:#dc2626}
-        .card{border:1px solid #e2e8f0;border-radius:16px;padding:20px;background:#fff;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05);margin-bottom:20px}
-        .card h3{margin:0 0 12px 0;font-size:16px;color:#0f172a;border-bottom:1px solid #f1f5f9;padding-bottom:8px}
-        table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
-        th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #f1f5f9}
-        th{background:#f8fafc;font-weight:700;color:#475569}
-        tr:hover{background:#f8fafc}
-        .badge{padding:3px 8px;border-radius:6px;font-size:11px;font-weight:700;text-transform:uppercase}
-        .badge-active{background:#dcfce7;color:#15803d}
-        .badge-inactive{background:#fee2e2;color:#b91c1c}
-        .badge-notfound{background:#f1f5f9;color:#475569}
-        .badge-auth{background:#dcfce7;color:#15803d}
-        .badge-denied{background:#fee2e2;color:#b91c1c}
-        .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-      </style>
-    </head>
-    <body>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-        <h1>📝 Historial de Operación y Diagnóstico</h1>
-        <div>
-          <a class="btn btn-primary" href="/">🏠 Volver al Inicio</a>
-          <a class="btn" href="/logs/download">📥 Descargar CSV Completo</a>
-          <a class="btn" href="/crash/view">⚠️ Ver Log de Crashes</a>
-          <a class="btn btn-danger" href="/logs/clear" onclick="return confirm('¿Seguro que deseas borrar el historial?')">🗑️ Borrar Historial</a>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>⚡ Estado de Hilos del Sistema (Watchdog)</h3>
-        <div style="display:flex;flex-wrap:wrap;gap:16px">
-          {% for th in thread_status %}
-            <div style="background:#f8fafc;padding:8px 12px;border-radius:8px;border:1px solid #e2e8f0;font-size:12px;min-width:180px">
-              <span class="status-dot" style="background:{{th.color}}"></span>
-              <b>{{th.name}}</b><br>
-              <span class="muted" style="color:#64748b">Estado: {{th.status}} ({{th.last_seen}})</span>
-            </div>
-          {% endfor %}
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>🚗 Últimos 300 Eventos Registrados</h3>
-        <table>
-          <thead>
-            <tr>
-              {% for h in headers %}
-                <th>{{h}}</th>
-              {% endfor %}
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in logs %}
-              <tr>
-                {% for cell in row %}
-                  <td>
-                    {% if cell == 'ACTIVE' or cell == 'PROPIETARIO' or cell == 'VISITA' %}
-                      <span class="badge badge-active">{{cell}}</span>
-                    {% elif cell == 'INACTIVE' %}
-                      <span class="badge badge-inactive">{{cell}}</span>
-                    {% elif cell == 'NOTFOUND' or cell == 'NONE' or cell == 'NoFound' %}
-                      <span class="badge badge-notfound">{{cell}}</span>
-                    {% elif cell == 'AUTORIZADO' %}
-                      <span class="badge badge-auth">{{cell}}</span>
-                    {% elif cell == 'DENEGADO' %}
-                      <span class="badge badge-denied">{{cell}}</span>
-                    {% else %}
-                      {{cell}}
-                    {% endif %}
-                  </td>
-                {% endfor %}
-              </tr>
-            {% else %}
-              <tr>
-                <td colspan="9" style="text-align:center;color:#64748b;padding:20px">No hay eventos registrados en el log local.</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    </body>
-    </html>
-    """
-    return render_template_string(html, headers=headers, logs=logs, thread_status=thread_status)
-
-@app.route("/logs/download")
-def download_logs():
-    if os.path.exists(LOG_FILE):
-        return send_file(LOG_FILE, as_attachment=True, download_name="portal_history.csv")
-    return "No hay archivo de log disponible", 404
-
-@app.route("/logs/clear")
-def clear_logs():
-    try:
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
-        return redirect("/logs")
-    except Exception as e:
-        return f"Error borrando archivo de logs: {e}", 500
-
-@app.route("/crash/view")
-def view_crash_log():
-    content = "No se ha registrado ningún crash en el sistema."
-    try:
-        if os.path.exists(CRASH_LOG):
-            with open(CRASH_LOG, "r", encoding="utf-8") as f:
-                content = f.read()
-    except Exception as e:
-        content = f"Error leyendo log de crashes: {e}"
-        
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <title>Log de Crashes - Comunito Portal</title>
-      <style>
-        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#f8fafc;color:#1e293b}
-        h1{margin:0 0 12px;font-weight:800;letter-spacing:-0.5px;color:#0f172a;font-size:26px}
-        .btn{padding:8px 14px;border:none;border-radius:8px;background:#cbd5e1;cursor:pointer;font-weight:600;font-size:13px;color:#334155;transition:all 0.2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
-        .btn:hover{background:#94a3b8;transform:translateY(-1px)}
-        .btn-primary{background:#2563eb;color:#fff}
-        .btn-primary:hover{background:#1d4ed8}
-        .btn-danger{background:#ef4444;color:#fff}
-        .btn-danger:hover{background:#dc2626}
-        pre{background:#0f172a;color:#cbd5e1;padding:20px;border-radius:12px;font-family:"SF Mono",ui-monospace,monospace;font-size:13px;overflow-x:auto;box-shadow:inset 0 2px 4px rgba(0,0,0,0.1);max-height:600px}
-      </style>
-    </head>
-    <body>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-        <h1>⚠️ Log de Diagnóstico de Crashes y Congelamientos</h1>
-        <div>
-          <a class="btn btn-primary" href="/logs">📋 Volver a Logs</a>
-          <a class="btn" href="/crash/download">📥 Descargar Log</a>
-          <a class="btn btn-danger" href="/crash/clear" onclick="return confirm('¿Seguro que deseas borrar el registro de crashes?')">🗑️ Limpiar Log</a>
-        </div>
-      </div>
-      <pre>{{content}}</pre>
-    </body>
-    </html>
-    """
-    return render_template_string(html, content=content)
-
-@app.route("/crash/download")
-def download_crash_log():
-    if os.path.exists(CRASH_LOG):
-        return send_file(CRASH_LOG, as_attachment=True, download_name="crash.log")
-    return "No hay archivo de crash disponible", 404
-
-@app.route("/crash/clear")
-def clear_crash_log():
-    try:
-        if os.path.exists(CRASH_LOG):
-            os.remove(CRASH_LOG)
-        return redirect("/crash/view")
-    except Exception as e:
-        return f"Error borrando archivo de logs de crash: {e}", 500
-
-def notify_watchdog():
-    sock_path = os.environ.get("NOTIFY_SOCKET")
-    if not sock_path:
-        return
-    if sock_path.startswith("@"):
-        sock_path = "\0" + sock_path[1:]
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
-            s.connect(sock_path)
-            s.sendall(b"WATCHDOG=1")
-    except Exception:
-        pass
-
-def _watchdog_thread():
-    time.sleep(10)
-    for k in list(thread_heartbeats.keys()):
-        thread_heartbeats[k] = time.time()
-        
-    while True:
-        time.sleep(5)
-        now = time.time()
-        stuck_threads = []
-        for name, ts in thread_heartbeats.items():
-            if now - ts > 45:
-                stuck_threads.append(name)
-        
-        if stuck_threads:
-            try:
-                with open(CRASH_LOG, "a", encoding="utf-8") as f:
-                    f.write(f"\n--- WATCHDOG WARNING AT {_iso_now_early()} ---\n")
-                    f.write(f"Hilos bloqueados o inactivos: {', '.join(stuck_threads)}\n")
-                    f.write("No se enviará el ping de Watchdog a systemd para forzar el reinicio.\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
-                pass
-            print(f"[WATCHDOG] Hilos bloqueados: {stuck_threads}. Forzando reinicio por inactividad.")
-        else:
-            notify_watchdog()
-
 # ----- Threads -----
-_load_wl_from_cache()
 for i in (1,2):
     threading.Thread(target=_alpr_loop, args=(i,), daemon=True).start()
     threading.Thread(target=_motion_loop, args=(i,), daemon=True).start()
 threading.Thread(target=_auto_refresh_loop, daemon=True).start()
 threading.Thread(target=_sysmon_loop, daemon=True).start()
 threading.Thread(target=_heartbeat_scheduler_loop, daemon=True).start()
-threading.Thread(target=_watchdog_thread, daemon=True).start()
 
 if __name__=="__main__":
     os.environ["TZ"]="America/Mexico_City"
+    os.environ["OMP_NUM_THREADS"]="2"
+    os.environ["OPENBLAS_NUM_THREADS"]="1"
     try:
         from waitress import serve
         serve(app, host="0.0.0.0", port=5000, threads=8)
